@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdfmergepy"
+version = "0.1.0"
+description = "Page-level PDF merge CLI (pikepdf-based) for comparing against CTS2.0's itext7 PdfMerger"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Gary Liu", email = "garyliu@seismic.com" }]
+dependencies = [
+    "pikepdf>=9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+pdfmergepy = "pdfmergepy.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

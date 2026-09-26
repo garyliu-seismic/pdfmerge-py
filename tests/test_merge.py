@@ -57,3 +57,5 @@ def test_merge_concatenates_pages(tmp_path: Path):
     with pikepdf.open(out) as merged:
         assert len(merged.pages) == 3
         assert int(merged.pages[2].obj.get("/Rotate", 0)) == 90
+        assert str(merged.docinfo["/Producer"]) == "pdfmergepy (pikepdf/QPDF)"
+        assert merged.pdf_version == "1.7"

@@ -18,6 +18,9 @@ import pikepdf
 from pdfmergepy.pdfutil import PageSpec
 
 
+PRODUCER = "pdfmergepy (pikepdf/QPDF)"
+
+
 def merge_files(specs: list[PageSpec], output: Path) -> None:
     if not specs:
         raise ValueError("no input files given")
@@ -28,5 +31,10 @@ def merge_files(specs: list[PageSpec], output: Path) -> None:
                 for page_num in spec.pages:
                     dst.pages.append(src.pages[page_num - 1])
 
+        # Match itext7's PdfMerger.cs, which explicitly declares 1.7
+        # (WriterProperties().SetPdfVersion(PdfVersion.PDF_1_7)) rather than
+        # leaving the header at whatever QPDF's default baseline is.
+        dst.docinfo["/Producer"] = PRODUCER
+
         output.parent.mkdir(parents=True, exist_ok=True)
-        dst.save(output)
+        dst.save(output, min_version="1.7")

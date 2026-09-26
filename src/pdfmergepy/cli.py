@@ -8,6 +8,8 @@ from pathlib import Path
 import pikepdf
 
 from pdfmergepy.merge import merge_files
+from pdfmergepy.mergeinfo import parse_merge_info
+from pdfmergepy.composite import merge_from_xml
 from pdfmergepy.pdfutil import PageSpec, page_geometry, parse_input_arg, parse_page_range
 
 
@@ -50,6 +52,31 @@ def _cmd_info(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_merge_xml(args: argparse.Namespace) -> int:
+    xml_path = Path(args.xml)
+    main_path = Path(args.main)
+    inputs_dir = Path(args.inputs_dir)
+    output_path = Path(args.output)
+
+    if not xml_path.exists():
+        print(f"error: merge-info XML not found: {xml_path}", file=sys.stderr)
+        return 1
+    if not main_path.exists():
+        print(f"error: main PDF not found: {main_path}", file=sys.stderr)
+        return 1
+    if not inputs_dir.is_dir():
+        print(f"error: inputs directory not found: {inputs_dir}", file=sys.stderr)
+        return 1
+
+    merge_info = parse_merge_info(xml_path)
+    merge_from_xml(merge_info, main_path, inputs_dir, output_path)
+    print(
+        f"merge-xml: {len(merge_info.merge_items)} MergeItem(s) "
+        f"-> {output_path}"
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pdfmergepy",
@@ -69,6 +96,19 @@ def build_parser() -> argparse.ArgumentParser:
     info_p = sub.add_parser("info", help="print per-page MediaBox/CropBox/Rotate as JSON (for diffing vs itext7 output)")
     info_p.add_argument("inputs", nargs="+", help="input PDFs, each optionally suffixed with a page range")
     info_p.set_defaults(func=_cmd_info)
+
+    xml_p = sub.add_parser(
+        "merge-xml",
+        help="merge PDFs according to a WorkspaceMergeInfo XML file (CTS2.0 format)",
+    )
+    xml_p.add_argument("xml", help="path to WorkspaceMergeInfo XML file")
+    xml_p.add_argument("--main", required=True, help="path to main/base PDF")
+    xml_p.add_argument(
+        "--inputs-dir", required=True,
+        help="directory containing external PDFs referenced by BlobId/MergedPdfFileId",
+    )
+    xml_p.add_argument("-o", "--output", required=True, help="output PDF path")
+    xml_p.set_defaults(func=_cmd_merge_xml)
 
     return parser
 

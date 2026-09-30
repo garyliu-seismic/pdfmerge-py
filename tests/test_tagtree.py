@@ -29,6 +29,7 @@ from pdfmergepy.tagtree import (
     merge_page_tags,
     migrate_tags_for_xobject,
     set_pdfua_metadata,
+    write_xmp_metadata,
     _is_tagged,
     _find_document_elem,
     _merge_rolemap,
@@ -943,3 +944,111 @@ def test_merge_xml_mode_a_has_xobj_tags(tmp_path: Path) -> None:
     sp = _xobj_struct_parents_slot(out_path)
     assert sp >= 0
     assert _parent_tree_has_slot(out_path, sp)
+
+
+# ---------------------------------------------------------------------------
+# 20. write_xmp_metadata: pdfuaid:part=1 written (Matterhorn 06-001)
+# ---------------------------------------------------------------------------
+
+def _validate_06_001(pdf_path: Path) -> str:
+    """Return 06-001 severity from pdftagvalicate --validate --json."""
+    import subprocess, json, sys
+    result = subprocess.run(
+        [sys.executable, "-m", "pdftagvalicate", str(pdf_path),
+         "--validate", "--json"],
+        capture_output=True, text=True,
+    )
+    raw = result.stderr.strip() or result.stdout.strip()
+    data = json.loads(raw)
+    for chk in data["checks"]:
+        if chk["id"] == "06-001":
+            return chk["severity"]
+    return "Unknown"
+
+
+def test_write_xmp_metadata_sets_pdfuaid(tmp_path: Path) -> None:
+    """write_xmp_metadata must write pdfuaid:part=1 so pdftagvalicate 06-001 passes."""
+    src_path = tmp_path / "src.pdf"
+    out_path = tmp_path / "out.pdf"
+    _make_tagged_pdf(src_path, lang="en-US", title="XMP Test")
+
+    dst = pikepdf.Pdf.new()
+    dst.add_blank_page(page_size=(612, 792))
+    with pikepdf.open(src_path) as src:
+        write_xmp_metadata(src, dst)
+    dst.save(out_path)
+
+    # Verify via pikepdf API
+    _PDFUAID_NS = "http://www.aiim.org/pdfua/ns/id/"
+    with pikepdf.open(out_path) as pdf:
+        with pdf.open_metadata(set_pikepdf_as_editor=False) as meta:
+            meta.register_xml_namespace(_PDFUAID_NS, "pdfuaid")
+            assert meta.get("pdfuaid:part") == "1", "pdfuaid:part must be '1'"
+            assert meta.get("dc:title") == "XMP Test"
+            assert meta.get("pdf:Producer") == "pdfmergepy (pikepdf/QPDF)"
+
+    # Also verify via pdftagvalicate subprocess
+    assert _validate_06_001(out_path) == "Pass", "06-001 must Pass after write_xmp_metadata"
+
+
+def test_write_xmp_metadata_title_and_lang(tmp_path: Path) -> None:
+    """Title and language from source must appear in dst XMP."""
+    src_path = tmp_path / "src.pdf"
+    out_path = tmp_path / "out.pdf"
+    _make_tagged_pdf(src_path, lang="fr-FR", title="Le Document")
+
+    dst = pikepdf.Pdf.new()
+    dst.add_blank_page(page_size=(612, 792))
+    with pikepdf.open(src_path) as src:
+        write_xmp_metadata(src, dst)
+    dst.save(out_path)
+
+    _PDFUAID_NS = "http://www.aiim.org/pdfua/ns/id/"
+    with pikepdf.open(out_path) as pdf:
+        with pdf.open_metadata(set_pikepdf_as_editor=False) as meta:
+            meta.register_xml_namespace(_PDFUAID_NS, "pdfuaid")
+            assert meta.get("pdfuaid:part") == "1"
+            assert meta.get("dc:title") == "Le Document"
+            # dc:language is a Bag -> returned as set
+            langs = meta.get("dc:language") or set()
+            assert "fr-FR" in langs
+
+
+def test_merge_files_xmp_06_001(tmp_path: Path) -> None:
+    """merge_files end-to-end must produce 06-001 Pass."""
+    src_path = tmp_path / "src.pdf"
+    out_path = tmp_path / "out.pdf"
+    _make_tagged_pdf(src_path, lang="en-US", title="Merge XMP Test")
+
+    merge_files([PageSpec(path=src_path, pages=(1,))], out_path)
+
+    assert _validate_06_001(out_path) == "Pass", "06-001 must Pass after merge_files"
+
+
+def test_merge_xml_mode_b_xmp_06_001(tmp_path: Path) -> None:
+    """merge_from_xml (Mode B) must produce 06-001 Pass."""
+    main_path = tmp_path / "main.pdf"
+    ext_path  = tmp_path / "blob-ext.pdf"
+    out_path  = tmp_path / "out.pdf"
+    _make_tagged_pdf(main_path, lang="en-US", title="XML Merge XMP Test")
+    _make_plain_pdf(ext_path, width=612, height=792)
+
+    xml_content = """\
+<?xml version="1.0" encoding="utf-16"?>
+<WorkspaceMergeInfo>
+  <PDFMerge>
+    <MergeItem FitPDFSize="true" SlideFitPattern="AlignTopLeft" pageCount="1"
+               id="xmp-test" BlobId="blob-ext">
+      <MergedPdfFileInfo MergedPdfFileId="" StartIndexInMergedFile="-1" />
+      <slideLocalId pdfPage="1" slideIndex="1">1</slideLocalId>
+    </MergeItem>
+  </PDFMerge>
+</WorkspaceMergeInfo>
+"""
+    xml_path = tmp_path / "merge.xml"
+    xml_path.write_bytes(xml_content.encode("utf-16"))
+
+    merge_info = parse_merge_info(xml_path)
+    merge_from_xml(merge_info, main_path, tmp_path, out_path)
+
+    assert _validate_06_001(out_path) == "Pass", "06-001 must Pass after merge_from_xml"

@@ -658,8 +658,9 @@ def merge_from_xml(
             # /StructParent inside <Link> struct elements with OBJR references.
             fix_link_annots(dst)
 
-            # Post-merge repairs (TH /Scope, etc.)
-            apply_post_merge_repairs(dst)
+            # Post-merge repairs: XMP pdfuaid:part (06-001) + TH /Scope (14-003).
+            # main_pdf is still open here so we can copy title/lang/dates from it.
+            apply_post_merge_repairs(dst, src=main_pdf)
 
             output_path.parent.mkdir(parents=True, exist_ok=True)
             dst.save(output_path, min_version="1.7")

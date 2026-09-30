@@ -39,6 +39,7 @@ def merge_files(specs: list[PageSpec], output: Path) -> None:
 
     with pikepdf.Pdf.new() as dst:
         _pdfua_set = False
+        _first_src: "pikepdf.Pdf | None" = None  # kept open for XMP repair below
         for spec in specs:
             with pikepdf.open(spec.path) as src:
                 # Propagate PDF/UA metadata from the first tagged source
@@ -70,8 +71,13 @@ def merge_files(specs: list[PageSpec], output: Path) -> None:
         # (no /StructParent) inside <Link> struct elements with OBJR references.
         fix_link_annots(dst)
 
-        # Post-merge repairs (TH /Scope, etc.) mirroring itext7's repair passes.
-        apply_post_merge_repairs(dst)
+        # Post-merge repairs: XMP pdfuaid:part (06-001) + TH /Scope (14-003).
+        # Re-open the first source to copy title/lang/dates into the XMP stream.
+        try:
+            with pikepdf.open(specs[0].path) as first_src:
+                apply_post_merge_repairs(dst, src=first_src)
+        except Exception:
+            apply_post_merge_repairs(dst, src=None)
 
         output.parent.mkdir(parents=True, exist_ok=True)
         dst.save(output, min_version="1.7")

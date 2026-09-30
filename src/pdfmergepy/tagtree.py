@@ -58,6 +58,7 @@ CTS2.0 source:
 
 from __future__ import annotations
 
+import datetime
 import logging
 from pathlib import Path
 from typing import Optional
@@ -177,6 +178,90 @@ def set_pdfua_metadata(src: pikepdf.Pdf, dst: pikepdf.Pdf) -> None:
 
     except Exception as exc:
         log.warning("tagtree: set_pdfua_metadata failed: %s", exc)
+
+
+_PDFUAID_NS = "http://www.aiim.org/pdfua/ns/id/"
+_DC_NS      = "http://purl.org/dc/elements/1.1/"
+_XMP_NS     = "http://ns.adobe.com/xap/1.0/"
+_PDF_NS     = "http://ns.adobe.com/pdf/1.3/"
+
+PRODUCER    = "pdfmergepy (pikepdf/QPDF)"
+
+
+def write_xmp_metadata(src: pikepdf.Pdf, dst: pikepdf.Pdf) -> None:
+    """Write a conforming XMP /Metadata stream to *dst*, including the
+    ``pdfuaid:part = '1'`` declaration required by Matterhorn 06-001 / PDF/UA-1.
+
+    Mirrors the metadata that itext7 writes via ``SetPDFUATag`` +
+    ``PdfDocumentInfo``, but adds the ``pdfuaid`` namespace block that itext7
+    omits by default (causing its own 06-001 failure).
+
+    Fields written
+    --------------
+    - ``pdfuaid:part``  = ``'1'``       (PDF/UA-1 conformance identifier)
+    - ``dc:title``      from *src* docinfo ``/Title`` (if present)
+    - ``dc:language``   from *src* Root ``/Lang``     (if present)
+    - ``dc:format``     = ``'application/pdf'``
+    - ``xmp:CreateDate`` preserved from *src* XMP    (if present)
+    - ``xmp:ModifyDate`` = UTC now
+    - ``pdf:Producer``  = ``'pdfmergepy (pikepdf/QPDF)'``
+
+    Safe to call when *dst* has no prior ``/Metadata`` stream; pikepdf creates
+    one automatically via ``open_metadata()``.
+    """
+    # Collect values from source
+    src_title: str | None = None
+    src_lang:  str | None = None
+    src_create_date: str | None = None
+    try:
+        title_val = src.docinfo.get("/Title")
+        if title_val:
+            src_title = str(title_val)
+        lang_val = src.Root.get("/Lang")
+        if lang_val:
+            src_lang = str(lang_val)
+        with src.open_metadata(set_pikepdf_as_editor=False) as src_meta:
+            src_create_date = src_meta.get("xmp:CreateDate")
+    except Exception as exc:
+        log.debug("write_xmp_metadata: could not read src metadata: %s", exc)
+
+    now_iso = (
+        datetime.datetime.now(datetime.timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    )
+
+    try:
+        with dst.open_metadata(set_pikepdf_as_editor=False) as meta:
+            meta.register_xml_namespace(_PDFUAID_NS, "pdfuaid")
+            meta.register_xml_namespace(_DC_NS, "dc")
+            meta.register_xml_namespace(_XMP_NS, "xmp")
+            meta.register_xml_namespace(_PDF_NS, "pdf")
+
+            # PDF/UA-1 conformance identifier  (Matterhorn 06-001)
+            meta["pdfuaid:part"] = "1"
+
+            # Document format
+            meta["dc:format"] = "application/pdf"
+
+            # Title
+            if src_title:
+                meta["dc:title"] = src_title
+
+            # Language (dc:language is an unordered Bag — pass as list)
+            if src_lang:
+                meta["dc:language"] = [src_lang]
+
+            # Timestamps
+            if src_create_date:
+                meta["xmp:CreateDate"] = src_create_date
+            meta["xmp:ModifyDate"] = now_iso
+
+            # Producer
+            meta["pdf:Producer"] = PRODUCER
+
+        log.debug("write_xmp_metadata: wrote pdfuaid:part=1 to dst")
+    except Exception as exc:
+        log.warning("write_xmp_metadata failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------

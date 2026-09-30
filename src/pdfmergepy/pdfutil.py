@@ -40,7 +40,7 @@ def parse_page_range(spec: str, total_pages: int) -> tuple[int, ...]:
             start = end = int(part)
 
         if start < 1 or end < start:
-            raise ValueError(f"invalid page range '{part}'")
+            raise ValueError(f"invalid page range '{part}' (start must be ≥ 1 and ≤ end)")
         if end > total_pages:
             raise ValueError(f"page range '{part}' exceeds document page count ({total_pages})")
         pages.extend(range(start, end + 1))

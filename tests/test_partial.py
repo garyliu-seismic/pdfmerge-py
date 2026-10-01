@@ -204,6 +204,123 @@ def test_build_matrix_identity_scale() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 9b. _page_display_size — CropBox + Rotate interaction (bug fix regression test)
+# ---------------------------------------------------------------------------
+
+def test_page_display_size_cropbox_rotate90(tmp_path: Path) -> None:
+    """CropBox [20,30,800,630] on a Rotate=90 page.
+
+    iText7 derives scale from (crop_h, crop_w) = (600, 780) because
+    CopyAsFormXObject bakes the rotation.  _page_display_size must return
+    the same effective dimensions so _set_fit_size produces matching scale.
+    """
+    import pikepdf
+    src = tmp_path / "src.pdf"
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(834, 654))   # MediaBox [0,0,834,654]
+    pdf.pages[0].obj["/Rotate"]   = pikepdf.Integer(90)
+    pdf.pages[0].obj["/CropBox"]  = pikepdf.Array([20, 30, 800, 630])
+    pdf.save(src)
+
+    from pdfmergepy.partial import _page_display_size
+    with pikepdf.open(src) as p:
+        dw, dh, cb = _page_display_size(p.pages[0].obj)
+
+    # crop_w=780, crop_h=600; after Rotate=90 swap -> display=(600, 780)
+    assert dw == pytest.approx(600.0, abs=0.1)   # crop_h (swapped)
+    assert dh == pytest.approx(780.0, abs=0.1)   # crop_w (swapped)
+    assert cb == pytest.approx((20.0, 30.0, 800.0, 630.0), abs=0.1)
+
+
+def test_page_display_size_cropbox_rotate0(tmp_path: Path) -> None:
+    """CropBox on a non-rotated page: effective size = CropBox w x h unchanged."""
+    import pikepdf
+    src = tmp_path / "src.pdf"
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(834, 654))
+    pdf.pages[0].obj["/CropBox"] = pikepdf.Array([20, 30, 800, 630])
+    pdf.save(src)
+
+    from pdfmergepy.partial import _page_display_size
+    with pikepdf.open(src) as p:
+        dw, dh, cb = _page_display_size(p.pages[0].obj)
+
+    assert dw == pytest.approx(780.0, abs=0.1)   # crop_w
+    assert dh == pytest.approx(600.0, abs=0.1)   # crop_h
+    assert cb is not None
+
+
+def test_page_display_size_no_cropbox_rotate90(tmp_path: Path) -> None:
+    """No CropBox, Rotate=90: display = (h, w) from MediaBox."""
+    import pikepdf
+    src = tmp_path / "src.pdf"
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(612, 792))
+    pdf.pages[0].obj["/Rotate"] = pikepdf.Integer(90)
+    pdf.save(src)
+
+    from pdfmergepy.partial import _page_display_size
+    with pikepdf.open(src) as p:
+        dw, dh, cb = _page_display_size(p.pages[0].obj)
+
+    assert dw == pytest.approx(792.0, abs=0.1)
+    assert dh == pytest.approx(612.0, abs=0.1)
+    assert cb is None
+
+
+def test_scaletofit_cropbox_rotate90_scale(tmp_path: Path) -> None:
+    """ScaleToFit with CropBox+Rotate=90: scale must match iText7's 0.858 x 0.495.
+
+    Regression for __temp_blob.xml case:
+      blob: MediaBox=834x654, CropBox=[20,30,800,630], Rotate=90
+      extCX=514.83, extCY=386.12, content-control=ScaleToFit
+      iText7 scale = extCX/600=0.858, extCY/780=0.495
+    """
+    import pikepdf, re
+    src = tmp_path / "src.pdf"
+    main = tmp_path / "main.pdf"
+    out = tmp_path / "out.pdf"
+
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(834, 654))
+    pdf.pages[0].obj["/Rotate"]  = pikepdf.Integer(90)
+    pdf.pages[0].obj["/CropBox"] = pikepdf.Array([20, 30, 800, 630])
+    pdf.save(src)
+    _make_blank_pdf(main, pages=1, w=960, h=540)
+
+    infos = [PartialPdfInfo(
+        blob_id="src", slide_index=1,
+        x=367.3803, y=66.5797,
+        ext_cx=514.82653543307083, ext_cy=386.1199212598425,
+        rotation=0.0, z_index=0,
+        content_control="ScaleToFit", h_align="Left", v_align="Top",
+    )]
+    apply_partial_pdf(infos, main, tmp_path, out)
+
+    # Extract the cm matrix from the output page's content
+    with pikepdf.open(out) as pdf:
+        pg = pdf.pages[0].obj
+        contents = pg["/Contents"]
+        if isinstance(contents, pikepdf.Array):
+            data = b"".join(s.read_bytes() for s in contents)
+        else:
+            data = contents.read_bytes()
+    matrices = re.findall(
+        rb'([\-\d.]+)\s+([\-\d.]+)\s+([\-\d.]+)\s+([\-\d.]+)\s+([\-\d.]+)\s+([\-\d.]+)\s+cm',
+        data
+    )
+    assert matrices, "No cm matrix found in output"
+    a, b, c, d, e, f = [float(v) for v in matrices[0]]
+    # After src-rotation compose: result is a rotation matrix, not identity-scale
+    # The scale embedded is sx=0.858, sy=0.495
+    # Composed with Rotate=90: [0, -sy, sx, 0, e, f]
+    assert abs(a) < 0.01, f"a should be ~0, got {a}"
+    assert c == pytest.approx(514.82653543307083 / 600.0, rel=0.01)  # sx = extCX/crop_h
+    assert abs(d) < 0.01, f"d should be ~0, got {d}"
+    assert abs(b) == pytest.approx(386.1199212598425 / 780.0, rel=0.01)  # sy = extCY/crop_w
+
+
+# ---------------------------------------------------------------------------
 # 10. _source_rotation_matrix
 # ---------------------------------------------------------------------------
 

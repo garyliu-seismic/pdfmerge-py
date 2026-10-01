@@ -387,14 +387,32 @@ def _compose(outer: list[float], inner: list[float]) -> list[float]:
 def _page_display_size(page_obj) -> tuple[float, float, Optional[tuple]]:
     """Return (display_w, display_h, crop_box_or_None) for a pikepdf page.
 
-    display_w/h are the *visual* dimensions (after applying /Rotate).
-    crop_box is (left, bottom, right, top) if /CropBox differs from /MediaBox.
+    display_w/h are the *effective visible* dimensions used for scaling —
+    they match what iText7's ``CopyAsFormXObject`` presents as its coordinate
+    space:
+
+    * **No CropBox**: MediaBox dimensions after applying ``/Rotate``
+      (width/height swapped for 90/270).
+    * **With CropBox** (and CropBox differs from MediaBox): CropBox
+      dimensions *after* applying ``/Rotate``.  iText7's
+      ``CopyAsFormXObject`` internally bakes the ``/Rotate`` transform, so
+      the resulting Form XObject has its axes already swapped.  Our
+      ``_page_as_form_xobject`` does NOT bake the rotation (it copies the
+      raw content stream), but we still need the *same scale factors* that
+      iText7 derives — which are based on ``(crop_h, crop_w)`` for
+      90/270-degree pages.  The raw ``_source_rotation_matrix`` composed
+      afterwards takes care of the axis swap in the content stream.
+
+    crop_box is returned as ``(left, bottom, right, top)`` when a real
+    CropBox is present; ``None`` otherwise.
     """
     mb = page_obj.get("/MediaBox")
     if mb is None:
         mb_x0, mb_y0, mb_x1, mb_y1 = 0.0, 0.0, 612.0, 792.0
     else:
         mb_x0, mb_y0, mb_x1, mb_y1 = (float(v) for v in mb)
+
+    rotation = int(page_obj.get("/Rotate", 0))
 
     cb = page_obj.get("/CropBox")
     crop_box: Optional[tuple] = None
@@ -404,13 +422,25 @@ def _page_display_size(page_obj) -> tuple[float, float, Optional[tuple]]:
                 abs(cb_x1-mb_x1) > 0.5 or abs(cb_y1-mb_y1) > 0.5):
             crop_box = (cb_x0, cb_y0, cb_x1, cb_y1)
 
-    rotation = int(page_obj.get("/Rotate", 0))
-    raw_w = mb_x1 - mb_x0
-    raw_h = mb_y1 - mb_y0
-    if rotation in (90, 270):
-        display_w, display_h = raw_h, raw_w
+    if crop_box is not None:
+        # Effective visible size = CropBox dimensions after rotation swap.
+        # iText7: pageSize = new Rectangle(cropBox.GetWidth(), cropBox.GetHeight())
+        # then CopyAsFormXObject bakes /Rotate, so the XObject's own axes
+        # are already swapped for 90/270-degree pages.
+        crop_w = crop_box[2] - crop_box[0]
+        crop_h = crop_box[3] - crop_box[1]
+        if rotation in (90, 270):
+            display_w, display_h = crop_h, crop_w
+        else:
+            display_w, display_h = crop_w, crop_h
     else:
-        display_w, display_h = raw_w, raw_h
+        # No CropBox: use MediaBox after rotation swap (unchanged behaviour).
+        raw_w = mb_x1 - mb_x0
+        raw_h = mb_y1 - mb_y0
+        if rotation in (90, 270):
+            display_w, display_h = raw_h, raw_w
+        else:
+            display_w, display_h = raw_w, raw_h
 
     return display_w, display_h, crop_box
 

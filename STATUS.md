@@ -257,6 +257,77 @@ pdfmerge-py/
 
 ---
 
+## Regression Test 框架（下一 session 新增）
+
+### 工具
+
+| 文件 | 位置 | 功能 |
+|------|------|------|
+| `bench_regression.py` | `C:/test/IText7Test/PdfMerge/` | 全量 regression：每个 XML 跑 iText7 + Python，PdfCompareTmp 逐页对比 |
+| `PdfCompareTmp` (已扩展) | `C:/test/IText7Test/PdfMerge/PdfCompareTmp/` | 新增 `geometry`、`matrix` 子命令，可直接调用 iText7 API 验证矩阵 |
+
+### 调用方式
+
+```bash
+cd C:/test/IText7Test/PdfMerge
+
+# 全量跑所有 41 个 XML
+python bench_regression.py --runs 1
+
+# 只跑某个 XML
+python bench_regression.py --xml "__blob_synthetic-rot90-crop.xml"
+
+# iText7 CLI（CWD = C:/test/IText7Test/PdfMerge，InputFiles 为相对路径）
+Seismic.CTS.Converter.LiveDoc.exe convert /Method:livedoc-merge \
+  <main.pdf> pdf --method-merge \
+  /InputFiles:inputs /WorkspaceMergeInfo:@<xml> /ITextVersion:7 /Output:<out.pdf>
+
+# Python pipeline（两步 chain for combined XML）
+pdfmergepy merge-xml <xml> --main <main.pdf> --inputs-dir inputs -o step1.pdf
+pdfmergepy partial-merge <xml> --main step1.pdf --inputs-dir inputs -o out.pdf
+```
+
+### 结果（41 个 PDFMerge XMLs，main=s1.t1.t2_43.pdf）
+
+```
+34 × MATCH(fmt)  — dcontent≤50 bytes，纯格式差异
+ 7 × DIFF(text)  — iText7 CRLF bug（见下），Python 正确
+```
+
+### MATCH(fmt) 详解（Python 与 iText7 逻辑完全一致，仅格式差异）
+
+| 差异项 | iText7 | Python |
+|--------|--------|--------|
+| 浮点精度 | `0.9174312`（7位）| `0.917431`（6位）|
+| 零分量 | `0 -0.733813` | `0.000000 -0.733813` |
+| XObject 名 | `/Fm1` | `/Xobj0` |
+| 多余包裹 | `q\nq\n/Fm1 Do\nQ\nQ\n\nQ\n` | `q\n/Xobj0 Do\nQ\nQ\n` |
+
+### DIFF(text) 详解（iText7 的 CRLF bug，Python 行为正确）
+
+**根本原因**：`GetPageBaseCTM` 用 `\nq\n` 检测 `q` guard，但 Windows PDF 的 CRLF `q\r\n` 不匹配，导致 guard check 失败，误检测内部的 `cm`。
+
+**受影响 blob**（ext page content stream 含 CRLF `q\r\n` + 内部 `cm`）：
+- `08cccc1b`、`19fe2e90`、`866bbbca`、`e6a73263`、`e8ae0dbc`、`fae3c6f6`、`Fiat500`
+
+**行为对比**（以 `19fe2e90`, ext=288×72，main=654×834 为例）：
+
+| | iText7（有 bug）| Python（正确）|
+|---|---|---|
+| 检测到 base CTM | `[288, 0, 0, 72, 0, 0.000008]` ❌ 误检 | 未检测到 ✅ |
+| effectiveMatrix | `[0.00030, 0, 0, 0.00120, 0, 0]`（极小！）| `[0.08631, 0, 0, 0.08631, 0, 0]`（正确）|
+| 视觉大小 | 0.23×0.72 pts（几乎不可见）❌ | 72×56 pts ✅ |
+| text 提取 | 0 chars ❌ | 2995 chars ✅ |
+
+Python 不需要修改；`bench_regression.py` 的 verdict 逻辑用 `DIFF(text)` 标记这 7 个 case。
+
+### 关键发现：旧 DLL 问题
+
+`Seismic.CTS.Implements.LiveDocs.dll` mtime = **2026-07-22**，已包含最新 source（最后 git commit = 2026-06-02）。
+之前 session 用的旧文件（`bench_out/` 目录）含 matrix `0.93525`，来自更早的 DLL 版本。**以 `regression_out/` 为准**。
+
+---
+
 ## 下一个 session 启动检查
 
 ```bash

@@ -10,6 +10,7 @@ import pikepdf
 from pdfmergepy.merge import merge_files
 from pdfmergepy.mergeinfo import parse_merge_info
 from pdfmergepy.composite import merge_from_xml
+from pdfmergepy.partial import apply_partial_pdf_from_xml
 from pdfmergepy.pdfutil import PageSpec, page_geometry, parse_input_arg, parse_page_range
 
 
@@ -113,7 +114,36 @@ def build_parser() -> argparse.ArgumentParser:
     xml_p.add_argument("-o", "--output", required=True, help="output PDF path")
     xml_p.set_defaults(func=_cmd_merge_xml)
 
+    partial_p = sub.add_parser(
+        "partial-merge",
+        help="overlay partial PDFs (sub-region XObjects) onto an existing PDF, driven by <partialPDF> XML",
+    )
+    partial_p.add_argument("xml", help="path to WorkspaceMergeInfo XML containing <partialPDF> block")
+    partial_p.add_argument("--main", required=True, help="path to the base PDF to draw onto")
+    partial_p.add_argument(
+        "--inputs-dir", required=True,
+        help="directory containing external PDFs referenced by blob-id",
+    )
+    partial_p.add_argument("-o", "--output", required=True, help="output PDF path")
+    partial_p.set_defaults(func=_cmd_partial_merge)
+
     return parser
+
+
+def _cmd_partial_merge(args: argparse.Namespace) -> int:
+    xml_path   = Path(args.xml)
+    main_path  = Path(args.main)
+    inputs_dir = Path(args.inputs_dir)
+    output     = Path(args.output)
+
+    for label, p in [("xml", xml_path), ("main", main_path), ("inputs-dir", inputs_dir)]:
+        if not p.exists():
+            print(f"error: {label} not found: {p}", file=sys.stderr)
+            return 1
+
+    n = apply_partial_pdf_from_xml(xml_path, main_path, inputs_dir, output)
+    print(f"partial-merge: {n} entry/entries applied -> {output}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

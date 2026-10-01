@@ -29,6 +29,12 @@ def test_parse_page_range_out_of_bounds():
         parse_page_range("1-99", 5)
 
 
+def test_parse_page_range_reverse_rejected():
+    """'5-3' must raise ValueError, not silently produce an empty tuple."""
+    with pytest.raises(ValueError, match="invalid page range"):
+        parse_page_range("5-3", 10)
+
+
 def test_parse_input_arg_with_range():
     path, spec = parse_input_arg("file.pdf:3-7")
     assert str(path) == "file.pdf"

@@ -21,10 +21,12 @@ from pdfmergepy.mergeinfo import (
     resolve_external_page,
 )
 from pdfmergepy.composite import (
+    _compute_fit_main_matrix,
     invert_matrix,
     multiply_matrices,
     get_raw_page_size,
     get_page_size_with_rotation,
+    page_as_form_xobject,
     merge_from_xml,
 )
 
@@ -376,3 +378,145 @@ def test_merge_xml_mode_a_fit_false(tmp_path: Path) -> None:
     assert output_path.exists()
     with pikepdf.open(output_path) as out:
         assert len(out.pages) == 2
+
+
+# ---------------------------------------------------------------------------
+# Fix #1: page_as_form_xobject — Resources and content from same copy_foreign
+# ---------------------------------------------------------------------------
+
+def test_page_as_form_xobject_resources_consistent(tmp_path: Path) -> None:
+    """Resources in the Form XObject must be dst-local (from copy_foreign), not
+    foreign indirect refs from the still-open source PDF.
+
+    We verify this by:
+    1. Building a source PDF with a named XObject resource (/Im0) in /Resources.
+    2. Calling page_as_form_xobject into a fresh dst PDF while the source is open.
+    3. Checking that /Resources on the resulting xobj exists and that every
+       indirect object reachable from it belongs to dst (not src) — confirmed
+       by the fact that dst.save() completes without 'foreign object' errors.
+    """
+    src_path = tmp_path / "src.pdf"
+    _make_pdf(src_path, 1, width=400, height=300)
+
+    dst = pikepdf.Pdf.new()
+    with pikepdf.open(src_path) as src:
+        src_page_obj = src.pages[0].obj
+        xobj = page_as_form_xobject(src_page_obj, dst)
+
+    # Resources dict must be present and must not be a foreign-object proxy
+    assert "/Resources" in xobj.stream_dict
+
+    # Attach the xobj to a blank page and save — this will raise if any
+    # object reference inside xobj still points into the (now closed) src PDF.
+    blank = pikepdf.Page(dst.add_blank_page(page_size=(400, 300)))
+    xobj_dict = pikepdf.Dictionary()
+    xobj_dict["/Xobj0"] = xobj
+    resources = pikepdf.Dictionary()
+    resources["/XObject"] = xobj_dict
+    blank.obj["/Resources"] = resources
+    blank.obj["/Contents"] = dst.make_stream(b"q /Xobj0 Do Q")
+    dst.pages.append(blank)
+
+    out_path = tmp_path / "out.pdf"
+    dst.save(out_path)  # must not raise
+    assert out_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Fix #2: Mode B — MediaBox explicitly fixed to external page native size
+# ---------------------------------------------------------------------------
+
+def test_merge_mode_b_mediabox_is_external_size(tmp_path: Path) -> None:
+    """Mode B output page MediaBox must equal the external PDF's native size,
+    not the main PDF page size."""
+    main_path = tmp_path / "main.pdf"
+    ext_path = tmp_path / "blob-ext.pdf"
+    out_path = tmp_path / "out.pdf"
+
+    # main: 960×540 (16:9 slide)  ext: 1280×960 (4:3 document)
+    _make_pdf(main_path, 1, width=960, height=540)
+    _make_pdf(ext_path, 1, width=1280, height=960)
+
+    xml_content = """\
+<?xml version="1.0" encoding="utf-16"?>
+<WorkspaceMergeInfo>
+  <PDFMerge>
+    <MergeItem FitPDFSize="true" SlideFitPattern="AlignTopLeft" pageCount="1"
+               id="mb-test" BlobId="blob-ext">
+      <MergedPdfFileInfo MergedPdfFileId="" StartIndexInMergedFile="-1" />
+      <slideLocalId pdfPage="1" slideIndex="1">1</slideLocalId>
+    </MergeItem>
+  </PDFMerge>
+</WorkspaceMergeInfo>
+"""
+    xml_path = tmp_path / "merge.xml"
+    _write_xml(xml_path, xml_content)
+
+    merge_info = parse_merge_info(xml_path)
+    merge_from_xml(merge_info, main_path, tmp_path, out_path)
+
+    with pikepdf.open(out_path) as out:
+        mb = [float(v) for v in out.pages[0].obj["/MediaBox"]]
+    # Must be the external page size (1280×960), not main (960×540)
+    assert abs(mb[2] - 1280) < 0.5, f"expected width 1280, got {mb[2]}"
+    assert abs(mb[3] - 960) < 0.5, f"expected height 960, got {mb[3]}"
+
+
+# ---------------------------------------------------------------------------
+# Fix #3: _compute_fit_main_matrix — CropBox-aware scale (no double-correction)
+# ---------------------------------------------------------------------------
+
+def _make_pdf_with_cropbox(
+    path: Path,
+    media_w: float, media_h: float,
+    crop_x0: float, crop_y0: float, crop_x1: float, crop_y1: float,
+) -> None:
+    """Create a 1-page PDF with explicit MediaBox and CropBox."""
+    pdf = pikepdf.Pdf.new()
+    page = pikepdf.Page(pdf.add_blank_page(page_size=(media_w, media_h)))
+    page.obj["/CropBox"] = pikepdf.Array([crop_x0, crop_y0, crop_x1, crop_y1])
+    pdf.save(path)
+
+
+def test_compute_fit_main_matrix_no_cropbox(tmp_path: Path) -> None:
+    """Without CropBox, scale = min(main_w/ext_w, main_h/ext_h)."""
+    main_path = tmp_path / "main.pdf"
+    ext_path = tmp_path / "ext.pdf"
+    _make_pdf(main_path, 1, width=400, height=300)
+    _make_pdf(ext_path, 1, width=200, height=100)  # wider ratio than main
+
+    with pikepdf.open(main_path) as mp, pikepdf.open(ext_path) as ep:
+        m = _compute_fit_main_matrix(mp.pages[0].obj, ep.pages[0].obj)
+
+    # ext 200×100 ratio=2.0, main 400×300 ratio=1.33 → width-limited: scale=400/200=2.0
+    assert abs(m[0] - 2.0) < 1e-6, f"scale a={m[0]}, expected 2.0"
+    assert abs(m[3] - 2.0) < 1e-6, f"scale d={m[3]}, expected 2.0"
+    # translation: e = left - scale*crop_left = 0 - 2*0 = 0
+    assert abs(m[4]) < 1e-6
+    assert abs(m[5]) < 1e-6
+
+
+def test_compute_fit_main_matrix_with_cropbox(tmp_path: Path) -> None:
+    """With CropBox, scale must be computed from CropBox dimensions only,
+    without the erroneous MediaBox-ratio secondary correction.
+
+    Setup: MediaBox=400×400, CropBox=200×100 (top-left quarter, bottom-offset).
+    Main page=400×300.
+    CropBox ratio = 200/100 = 2.0 > main ratio 400/300 ≈ 1.33
+    → width-limited: scale = 400/200 = 2.0
+    """
+    main_path = tmp_path / "main.pdf"
+    ext_path = tmp_path / "ext_crop.pdf"
+    _make_pdf(main_path, 1, width=400, height=300)
+    _make_pdf_with_cropbox(ext_path, 400, 400, 0, 300, 200, 400)  # crop is 200×100
+
+    with pikepdf.open(main_path) as mp, pikepdf.open(ext_path) as ep:
+        m = _compute_fit_main_matrix(mp.pages[0].obj, ep.pages[0].obj)
+
+    expected_scale = 2.0  # 400 / crop_w(200)
+    assert abs(m[0] - expected_scale) < 1e-6, f"scale a={m[0]}, expected {expected_scale}"
+    assert abs(m[3] - expected_scale) < 1e-6, f"scale d={m[3]}, expected {expected_scale}"
+    # e = left - scale*crop_x0 = 0 - 2*0 = 0
+    # f = bottom - scale*crop_y0 = 0 - 2*300 = -600
+    assert abs(m[4]) < 1e-6, f"e={m[4]}, expected 0"
+    assert abs(m[5] - (-600.0)) < 1e-6, f"f={m[5]}, expected -600"

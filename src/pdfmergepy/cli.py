@@ -82,6 +82,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="pdfmergepy",
         description="Page-level PDF merge CLI (pikepdf-based POC), for diffing against CTS2.0's itext7 PdfMerger",
     )
+    parser.add_argument(
+        "--version", action="version", version="%(prog)s 0.1.0 (pikepdf/QPDF)"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     merge_p = sub.add_parser("merge", help="concatenate page ranges from one or more PDFs into one output PDF")

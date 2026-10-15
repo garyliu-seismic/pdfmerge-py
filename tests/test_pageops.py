@@ -424,3 +424,16 @@ def test_keep_only_pages_stats(src):
         st = keep_only_pages(p, [0, 1])
         assert st["removed_pages"] == 4 and st["removed_struct_elems"] > 0
         assert len(p.pages) == 2
+
+
+def test_append_untagged_source_leaves_no_dangling_structparents(tmp_path):
+    a = build_pdf(tmp_path / "a.pdf", n=2, text_prefix="A")
+    b = build_pdf(tmp_path / "b.pdf", n=2, text_prefix="B")
+    with pikepdf.open(b, allow_overwriting_input=True) as p:     # stale /StructParents, no tag tree
+        del p.Root["/StructTreeRoot"]
+        p.save(b)
+    out = tmp_path / "o.pdf"
+    pageops.append_files([a, b], out)
+    with pikepdf.open(out) as p:
+        assert tag_problems(p)["page_structparents_missing_key"] == 0
+        assert all("/StructParents" not in pg.obj for pg in list(p.pages)[2:])

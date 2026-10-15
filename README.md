@@ -17,6 +17,11 @@ POC-phase Python rewrite of CTS2.0's itext7-based PDF merge pipeline.
 | PDF/UA metadata propagation (/Lang, /Title, XMP) | ✅ Done | `tagtree.set_pdfua_metadata` |
 | Post-merge TH /Scope repair (Matterhorn 14-003) | ✅ Done | `_repairs.apply_post_merge_repairs` |
 | Regression test — all 41 real blob inputs × Mode A+B | ✅ Done | `tests/test_regression_inputs.py` |
+| Partial PDF overlay (`<partialPDF>`) | ✅ Done | `partial.py`, `partial-merge` CLI |
+| Page ranges `1,3,6-8,10-` (port of `EnumAllPageSections`) | ✅ Done | `pageranges.py` |
+| `select` / `delete` pages (tags, forms, outlines pruned) | ✅ Done | `pageops.py` + `prune.py` |
+| `split` into `0000.pdf, 0001.pdf, ...` | ✅ Done | `pageops.split_pdf` |
+| `append` whole PDFs (reuses merge engine) / `page-count` | ✅ Done | `pageops.py` |
 | Post-merge repairs (FixInvalidTBodies, AlterChartAsFigure) | 🔲 Planned | lower priority |
 
 ## Validate results vs itext7 (real merge, 17-slide deck)
@@ -57,17 +62,44 @@ pdfmergepy info out.pdf
 
 # WorkspaceMergeInfo XML-driven merge (CTS2.0 format, Mode A/B compositing)
 pdfmergepy merge-xml merge.xml --main main.pdf --inputs-dir ./blobs -o out.pdf
+
+# Overlay <partialPDF> sub-regions onto a base PDF
+pdfmergepy partial-merge merge.xml --main main.pdf --inputs-dir ./blobs -o out.pdf
+
+# Page operations (ports of CTS2.0 `pdf select|delete|split`, PdfManager.GetPageCount)
+pdfmergepy page-count in.pdf
+pdfmergepy select in.pdf --pages "1,3,6-8,10-" -o out.pdf      # keep these pages
+pdfmergepy delete in.pdf --pages "1,3,6-8,10-" -o out.pdf      # drop these pages
+pdfmergepy split  in.pdf --pages 3,6 -o outdir/                # 0000.pdf (3 pp), 0001.pdf (6 pp), 0002.pdf (rest)
+pdfmergepy append a.pdf b.pdf c.pdf -o out.pdf                 # same engine as `merge`, whole documents
+# encrypted input: add --password (select/delete/split/page-count)
 ```
+
+Page expressions follow `PdfUtility.EnumAllPageSections`: single `5`, range `3-7`,
+open end `10-`, open start `-6`; out-of-range / duplicate / reversed (`7-3`)
+items are harmless and output keeps the original page order; `0`, `-`, text and
+values > int32 are errors. `select`/`delete` that would produce an empty document
+are an error (iText cannot write a 0-page file either). Output is PDF 1.7 and keeps
+/Lang, /Title, DisplayDocTitle; tagged sources also keep /MarkInfo and get XMP
+`pdfuaid:part=1`.
+
+select / delete / split keep the whole source, delete the unwanted pages and then
+**prune** the tag tree (StructElems, `/Pg`, `/K`, ParentTree), AcroForm fields,
+outlines, named destinations, link/open-action destinations and page labels
+(`prune.py`) — so PDF/UA tags survive instead of dangling.
 
 ## Tests
 
 ```sh
 python -m pytest tests/ --ignore=tests/_proto_tagtree.py
-# 60 passed  (unit + integration)
+# 270 passed  (unit + integration + real-data regression; ~3 min with the real data present)
 
-# Real-data regression (requires C:\test\IText7Test\PdfMerge\inputs\)
+# Real-data regression (requires C:\test\IText7Test\PdfMerge\inputs\ and pdftagvalicate)
 python -m pytest tests/test_regression_inputs.py -v
-# 82 passed  (41 blobs × Mode A + Mode B)
+# 82 passed  (41 blobs x Mode A + Mode B)
+python -m pytest tests/test_regression_pageops.py -v
+# 41 passed  (select/delete/split/append per blob; validator Fail ids must be a subset of the source's)
+# tests/conftest.py puts src/ on sys.path + PYTHONPATH, so `pip install -e .` is not required
 ```
 
 ## Architecture
@@ -82,8 +114,12 @@ tagtree.py        StructTree    →  merge_page_tags (plain-copy, ParentTree+MCR
                                    fix_link_annots (Matterhorn 28-001)
 _repairs.py       post-merge    →  pdftagvalicate TH /Scope repair
 mergeinfo.py      XML parsing   →  WorkspaceMergeInfo / MergeItem / SlideLocalId
-pdfutil.py        utilities     →  page range parsing, geometry inspection
-cli.py            CLI           →  argparse (merge / info / merge-xml)
+pdfutil.py        utilities     →  merge's `file.pdf:1-3` range parsing, geometry inspection
+pageranges.py     page ranges   →  PdfUtility.EnumAllPageSections / PageSection (select/delete/split)
+prune.py          page removal  →  delete pages + prune StructTree/ParentTree/AcroForm/outlines/dests/labels
+pageops.py        page ops      →  select / delete / split / append (merge engine) / page-count
+cli.py            CLI           →  argparse (merge / info / merge-xml / partial-merge /
+                                   split / select / delete / append / page-count)
 ```
 
 ## Comparing against CTS2.0 (itext7)

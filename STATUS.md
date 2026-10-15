@@ -13,7 +13,7 @@
 ```
 editable install : pip install -e .
 测试命令         : python -m pytest tests/ --ignore=tests/_proto_tagtree.py -q
-当前结果         : 167 passed, 0 failed
+当前结果         : 270 passed, 0 failed   (含 real-data regression，约 3 分钟；conftest.py 自动把 src/ 加入 sys.path/PYTHONPATH)
 ```
 
 ---
@@ -29,7 +29,10 @@ editable install : pip install -e .
 | `pdfutil.py` | ~75 | 页面范围解析 / page_geometry inspect | 工具层 |
 | `acroform.py` | ~145 | AcroForm 字段复制 + 冲突重命名 + DR 合并 | `PdfPageFormCopier` / `CustomCopier` |
 | `tagtree.py` | ~1000 | StructTree plain-copy + XObject MCR 迁移 | `PdfMergeTagHelper` |
-| `cli.py` | ~160 | CLI（`merge` / `info` / `merge-xml` / `partial-merge`） | — |
+| `cli.py` | ~230 | CLI（`merge` / `info` / `merge-xml` / `partial-merge` / `split` / `select` / `delete` / `append` / `page-count`） | — |
+| `pageranges.py` | ~110 | **页码表达式 `1,3,6-8,10-`**（精确移植） | `PdfUtility.EnumAllPageSections` / `PageSection.IsInclude` |
+| `prune.py` | ~480 | **删页 + 修剪 StructTree/ParentTree/AcroForm/Outlines/Dests/PageLabels** | `CopyPagesTo` + `PdfPageFormCopier` 的效果 |
+| `pageops.py` | ~170 | **select / delete / split / append / page-count** | `PdfSelector` / `PdfSplitter` / `PdfSplitConverter` / `PdfManager.GetPageCount` |
 
 ---
 
@@ -155,6 +158,58 @@ WorkspaceMergeInfo.xml  (PDFMerge only)      855ms     471ms      N/A    ERR*
 
 ---
 
+## split / select / delete / append / page-count（feature/split-select-append）
+
+### 策略（delete-from-copy，而非 add_pages_from）
+
+iText7 `CopyPagesTo` 会把 tag tree + ParentTree + AcroForm 一起复制；pikepdf `add_pages_from` 不带 tag（会悬空）。
+因此 select/delete/split 采用：**打开源文件整份保留 → 删掉不要的页 → 修剪所有仍指向被删页的结构 → 保存**（`prune.keep_only_pages`）。
+`append` 就是 `merge.merge_files`（已经是 generic append：tagtree.merge_page_tags + acroform），CLI `append` 直接复用，不重复实现。
+
+`prune.py` 修剪清单：
+- StructTreeRoot：删除落在被删页上的 MCID/MCR/OBJR kid；kid 清空的 StructElem 级联删除（自底向上、迭代实现，无递归深度问题）；幸存元素若 `/Pg` 指向被删页则去掉 `/Pg`；过滤 `/Ref`、`/IDTree`。
+- ParentTree：全部元素已删的条目整条丢弃；数组里已删元素置 null（下标 = MCID，不压缩）；重写为扁平 `/Nums`（避免 `/Limits` 过期）。
+- AcroForm：只保留在保留页上有 widget 的字段（共享字段只保留保留页上的 widget kid）；无 widget 的字段保留；删除 `/XFA`；无字段则删掉 `/AcroForm`；过滤 `/CO`。
+- Outlines：目标页被删的条目移除（有存活子孙时保留容器、去掉其 dest），重连 Prev/Next/First/Last/Parent，重算 `/Count`（保留 open/closed 符号）。
+- 命名目的地（`/Names/Dests`、`/Dests`）、保留页上 Link 注解的 `/Dest` 与 GoTo `/A`、`/OpenAction`；`/PageLabels` 重新编号使保留页**显示的页标不变**。
+- 安全网：最后扫描所有对象，把仍指向已删页的引用置空，保证不会把孤儿页（带全部内容）写进输出。
+
+输出：PDF 1.7（`force_version`）；保留 /Lang、/Title、整份 docinfo；`ViewerPreferences/DisplayDocTitle=true`；有 tag 的源另写 `/MarkInfo/Marked` 与 XMP `pdfuaid:part=1`；`remove_unreferenced_resources()`；Producer = pdfmergepy。
+
+### 与 C# 的语义对应 / 已知差异
+
+| 项 | C# | Python | 说明 |
+|---|---|---|---|
+| 页码表达式 | `EnumAllPageSections` | `pageranges.py` 逐条移植 | 单页 End=0；`4-`→MaxValue；`-6`→MinValue；倒序 `7-3` 匹配空集（不报错）；越界/重复无害；`0`、`-`、非数字、>int32 报错；输出保持原页序、不重复 |
+| split | `0000.pdf`…，余页放最后一个文件，页用完即停 | 同 | `parse_split_counts` 同 `__ParsePage`（必须 >0 整数）；0 页文档无输出文件 |
+| 空结果 | iText 写 0 页文件会抛异常 | 明确报 ValueError（"empty document"） | select/delete 结果为空时 |
+| 未打 tag 的源 | `SetTagged()` 会生成空 struct tree | **保持未打 tag**（不写空 StructTreeRoot、不写 pdfuaid） | 故意偏离：对无 tag 内容声称 PDF/UA 不实 |
+| 非 Title 的 docinfo（Author 等） | 新文档只复制 Title/Lang | 全部保留 | 超集 |
+| 页标（PageLabels） | iText 版本相关 | 重新编号保持显示不变 | |
+| 无 widget 的 AcroForm 字段 | 不复制 | 保留 | 可能带计算脚本，无害 |
+| 加密 | 抛异常 | owner-only 加密可直接处理并输出**未加密**文件；需要 user password 时抛 `PdfInputError`（可 `--password`） | |
+| 损坏文件 | 抛异常 | `PdfInputError: not a valid / readable PDF`，CLI 退出码 1 | |
+| split 多块 | 每块重开源文件 | 同，每块重新 prune（O(块数 × 树大小)） | 130 页带 tag 文档 split 约 1.2s |
+
+### 设计决策 / fork
+1. **删页后保留整份文档而非复制页**：唯一能保证 tag tree 完整（含 MCR `/Stm`、OBJR、跨页元素）的方案。代价：每块 split 都要走一次 prune。
+2. **跨页 StructElem 的部分删除**：Table/List/Sect 这类跨页容器只丢被删页上的 kid，容器本身保留（语义上可能出现 TBody 失去表头行，与 iText CopyPagesTo 行为同类，未单独处理）。
+3. `09-007`（首个标题必须是 H1）取决于**保留了哪些页**（删掉含 H1 的页就会 fail），回归测试把它列为 content-dependent 允许项。
+4. 顺手修复 merge 引擎的既有缺陷：源未打 tag 或页面无 marked content 时，目标页遗留/分配了悬空 `/StructParents`（ParentTree 里没有该 key）。`merge.merge_files` 现在在 `merge_page_tags` 返回 False 时删除该 key（有测试）。
+
+### 验证（见测试）
+- `tests/test_pageranges.py` 22；`tests/test_pageops.py` 40（split 命名/余页、select/delete 页数与内容、struct tree 完整性、AcroForm、outline/dests/labels、加密/损坏输入、CLI）；
+- `tests/test_regression_pageops.py` 41：每个真实样本跑 select/delete/split/append，`pdftagvalicate` 的 Fail/Error id 必须是源文件自身基线的子集（`09-007` 例外），且 `tests/tagcheck.py` 的结构完整性问题数不得多于源、孤儿页对象恒为 0。
+- 性能（本机，Python 3.12，pikepdf 10.13）：4.6MB/49p 无 tag 文件 select 1-5 ≈ 0.02s、峰值 WS 35MB；4.1MB/130p 带 tag（4477 个 StructElem 被剪）select 1-5 ≈ 0.55s、split 5 页一块（2 个文件）≈ 1.2s、峰值 WS ≈ 65MB（均不含 0.15s 解释器 import）。
+
+### 未覆盖 / 已知缺口
+- 未与 iText7 逐字节对比（无 iText 基线，仅与源文件自身的验证基线比较）。
+- Article threads、`/AA`、RichMedia/3D 等罕见结构只由安全网置空引用，未做语义修剪。
+- 页面范围里的重复/乱序不会产生重复页或重排（与 C# predicate 语义一致）；若以后需要“按表达式顺序重排”需另行设计。
+- StructTree 里 `/Pg` 缺省且 int MCID 的元素（页由祖先隐含）按“保留”处理。
+
+---
+
 ## 已修复的关键 Bug（累计）
 
 1. **`page_as_form_xobject`**：content stream 与 Resources 来自同一 `copy_foreign`，避免 foreign object 引用泄漏。
@@ -233,8 +288,16 @@ pdfmerge-py/
 │   ├── mergeinfo.py     # WorkspaceMergeInfo <PDFMerge> XML 解析（完成）
 │   ├── partial.py       # Partial PDF sub-region overlay（完成；本 session 新增）
 │   ├── pdfutil.py       # 页面范围/几何工具（完成）
-│   └── tagtree.py       # StructTree plain-copy + XObject MCR 迁移（完成）
+│   ├── tagtree.py       # StructTree plain-copy + XObject MCR 迁移（完成）
+│   ├── pageranges.py    # 页码表达式（新）
+│   ├── pageops.py       # select/delete/split/append/page-count（新）
+│   └── prune.py         # 删页后的 tag/form/outline 修剪（新）
 ├── tests/
+│   ├── conftest.py            # src/ → sys.path + PYTHONPATH（子进程也可用）
+│   ├── test_pageranges.py     # 22 用例（新）
+│   ├── test_pageops.py        # 40 用例（新）
+│   ├── test_regression_pageops.py  # 41 用例（真实样本 + pdftagvalicate，新）
+│   ├── pdfbuilder.py / tagcheck.py # 合成 PDF 构造器 / struct 完整性检查器（新）
 │   ├── test_acroform.py    # 11 用例
 │   ├── test_merge.py       # 7 用例
 │   ├── test_mergeinfo.py   # 17 用例
@@ -335,7 +398,7 @@ cd C:/project_new/pdfmerge-py   # 或 clone 到本地
 
 # 确认当前状态
 python -m pytest tests/ --ignore=tests/_proto_tagtree.py -q
-# 期望: 167 passed, 0 failed
+# 期望: 270 passed, 0 failed
 
 # 运行 benchmark（需要 CTS2.0 LiveDocConverter 已编译）
 cd C:/test/IText7Test/PdfMerge

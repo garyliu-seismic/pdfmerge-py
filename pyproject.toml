@@ -12,11 +12,13 @@ license = { text = "Proprietary" }
 authors = [{ name = "Gary Liu", email = "garyliu@seismic.com" }]
 dependencies = [
     "pikepdf>=9.0",
+    "fonttools>=4.40",   # MIT - font parsing for embed-fonts
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pypdfium2",   # optional (Apache-2.0/BSD): render checks in font tests
 ]
 
 [project.scripts]

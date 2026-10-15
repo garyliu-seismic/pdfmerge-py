@@ -13,7 +13,7 @@
 ```
 editable install : pip install -e .
 测试命令         : python -m pytest tests/ --ignore=tests/_proto_tagtree.py -q
-当前结果         : 270 passed, 0 failed   (含 real-data regression，约 3 分钟；conftest.py 自动把 src/ 加入 sys.path/PYTHONPATH)
+当前结果         : 326 passed, 0 failed   (含 real-data regression，约 4 分钟；conftest.py 自动把 src/ 加入 sys.path/PYTHONPATH)
 ```
 
 ---
@@ -29,10 +29,13 @@ editable install : pip install -e .
 | `pdfutil.py` | ~75 | 页面范围解析 / page_geometry inspect | 工具层 |
 | `acroform.py` | ~145 | AcroForm 字段复制 + 冲突重命名 + DR 合并 | `PdfPageFormCopier` / `CustomCopier` |
 | `tagtree.py` | ~1000 | StructTree plain-copy + XObject MCR 迁移 | `PdfMergeTagHelper` |
-| `cli.py` | ~230 | CLI（`merge` / `info` / `merge-xml` / `partial-merge` / `split` / `select` / `delete` / `append` / `page-count`） | — |
+| `cli.py` | ~330 | CLI（`merge` / `info` / `merge-xml` / `partial-merge` / `split` / `select` / `delete` / `append` / `page-count` / `list-fonts` / `embed-fonts` / `remove-fonts`） | — |
 | `pageranges.py` | ~110 | **页码表达式 `1,3,6-8,10-`**（精确移植） | `PdfUtility.EnumAllPageSections` / `PageSection.IsInclude` |
 | `prune.py` | ~480 | **删页 + 修剪 StructTree/ParentTree/AcroForm/Outlines/Dests/PageLabels** | `CopyPagesTo` + `PdfPageFormCopier` 的效果 |
 | `pageops.py` | ~170 | **select / delete / split / append / page-count** | `PdfSelector` / `PdfSplitter` / `PdfSplitConverter` / `PdfManager.GetPageCount` |
+| `fonts.py` | ~350 | 字体发现（继承 Resources、Form XObject、Pattern、SMask、Annot AP、Type3、AcroForm DR）、`list_fonts`、`remove_fonts` | `InternalUtility.GetAllFontRelatedObjects` / `RemoveFonts` / `GetUsedFonts` |
+| `fontmap.py` | ~330 | font-map.json 加载 + PostScript/Family+Style 匹配 | `FontMapItem` / `FontMapUtility` / `FontDictionary` / `PdfOtfFontProcessor.__GetRelation` |
+| `fontembed.py` | ~480 | 就地嵌入完整字体（simple + Type0），CID/GID 校验 | `PdfOtfFontProcessor.EmbedFont` |
 
 ---
 
@@ -65,6 +68,8 @@ pdfmergepy partial-merge merge.xml --main main.pdf --inputs-dir blobs/ -o out.pd
 | `test_mergeinfo.py` | 17 | XML 解析（direct/ApplySlide）、路径解析、矩阵数学、Mode A/B 集成、Form XObject resources |
 | `test_acroform.py` | 11 | AcroForm 字段复制、名称冲突重命名、嵌套 parent/kids、/DR 合并、Mode A&B |
 | `test_tagtree.py` | 16 | StructTree 结构、RoleMap、ParentTree slot、/Pg 引用、PDF/UA metadata、mixed tagged/plain |
+| `test_fonts.py` | **36** | 字体发现/匹配/嵌入/移除/CLI/加密/渲染（pypdfium2） |
+| `test_regression_fonts.py` | **20** | 真实样本：18 个 blob PDF（嵌入 + pdftagvalicate 31-001）、CloudFonts baseline、真实 CFF OTF |
 | `test_partial.py` | **21** | partialPDF XML 解析、4种 content-control、CropBox+Rotate 矩阵、end-to-end overlay、z-index 多层、hidden slide、真实 XML round-trip |
 
 `tests/_proto_tagtree.py`：原型脚本，已排除在 pytest 之外。
@@ -398,7 +403,7 @@ cd C:/project_new/pdfmerge-py   # 或 clone 到本地
 
 # 确认当前状态
 python -m pytest tests/ --ignore=tests/_proto_tagtree.py -q
-# 期望: 270 passed, 0 failed
+# 期望: 326 passed, 0 failed
 
 # 运行 benchmark（需要 CTS2.0 LiveDocConverter 已编译）
 cd C:/test/IText7Test/PdfMerge
@@ -409,3 +414,47 @@ python bench_partial.py
 # PdfPageRectangle.cs:  CreateFromPPTSize, GetMatrix
 code "C:/project_new/content-transformation-service-v2/src/CTS/Seismic.CTS.Implements.LiveDocs/IText7/PartialPdfMerger.cs"
 ```
+
+
+---
+
+## 字体：embed-fonts / remove-fonts / list-fonts（branch `feature/embed-fonts`）
+
+仅用 pikepdf（MPL-2.0）+ fontTools（MIT）；无 PyMuPDF/AGPL。
+
+```sh
+pdfmergepy list-fonts in.pdf [--missing-only] [--password P]      # JSON: name,type,embedded,subset,font_file,pages,used_in
+pdfmergepy embed-fonts in.pdf -o out.pdf --font-map font-map.json --font-dir DIR --font Helvetica=arial.ttf \
+          [--strict] [--ignore-license] [--allow-unverified-cid] [--remap-cid-via-tounicode] [--report r.json|-] [--require-all]
+pdfmergepy remove-fonts in.pdf -o out.pdf [--min-size BYTES] [--subset yes|no] [--name-regex RE] [--large-pdf-rule]
+```
+
+### 字体来源（对标 FontMapItem/FontMapUtility）
+- `--font-map X`：C# `font-map.json`（`{"files":[{path,names[],styles,format,...}]}`，path 相对 JSON 目录）或 C# 文本形式 `Name|path;Name|path`。
+- `--font-dir D`：有 `D/font-map.json` 就用它（同 C#），否则递归扫描 `*.ttf/otf/ttc/pfb`（TTC 逐 face 展开）。
+- `--font NAME=path`：直接指定，NAME 作为精确别名（PostScript/family）。
+- 名称/样式实际从字体文件读取（fontTools）；JSON `names` 仅追加别名。相同元数据的重复字体只保留第一个（同 C#）。
+
+### 匹配（对标 `__GetRelation`）
+BaseFont 去掉 `ABCDEF+` 前缀 -> 1) PostScript/FullName/别名精确匹配（忽略大小写/空格/连字符）-> 2) Family+Style（移植 C# Regular/Bold/Italic/BoldItalic 各分支，含 "Use Regular instead" 回退）。
+扩展：除 `Family,Style` 外还识别 `Family-Style`、`FamilyBoldMT`、`ArialMT`。`--strict` 关闭 Bold->Regular 回退。回退匹配会在 warnings 中标出。
+
+### 设计决定
+1. **就地修改**字体字典（C# 新建字体并改引用，旧对象成孤儿）：所有引用（页面/Form/Annot/DR）保持有效，无孤儿对象，同一字体文件流在多个字体间共享。
+2. **保留** 原 /Encoding、/Widths、/ToUnicode、/W、/DW、/Flags；缺失时才补 /Widths（由字体 hmtx + 编码推出）、FontDescriptor 的 FontBBox/Ascent/Descent/CapHeight/ItalicAngle/StemV/Flags。C# 是用 WINANSI 重建 simple font，只适用于单字节 WinAnsi 文本；本实现对 Type0/自定义编码同样有效。
+3. **不改内容流、不改结构树/tags**（测试断言 StructTreeRoot 与 Contents 字节不变）。BaseFont/FontName 改为字体文件的 PostScript 名（去掉 subset 前缀，因为嵌入的是完整字体）。
+4. **字体程序存储（OpenType vs Type1C 的选择）**：glyf -> `/FontFile2`（+Length1）；CFF OTF -> 取出裸 `CFF ` 表存 `/FontFile3 /Type1C`（simple，Subtype 改 /Type1）或 `/CIDFontType0C`（Type0）；**不使用 /OpenType 包装**（兼容性最好，不要求 PDF 1.6）。CID-keyed CFF 不能用于 simple font -> 跳过。`.pfb` -> `/FontFile`（Length1/2/3），仅 simple。
+5. **Type0 的 CID/GID 安全**：只处理 Identity-H/V（CIDSystemInfo Ordering=Identity）。用 /W 宽度 vs hmtx、/ToUnicode vs cmap 校验 "CID == 所供字体的 GID"（>=90% 一致才通过）；不一致 -> **跳过并 warning**（不静默损坏）；没有任何证据（无 /W 无 ToUnicode）-> 跳过，除非 `--allow-unverified-cid`。`--remap-cid-via-tounicode`：不一致时用 ToUnicode 重建 /CIDToGIDMap（仅 glyf；重建后再用 /W 复核，复核不过仍跳过）。预定义 CMap（90ms-RKSJ-H 等，CID 为 Adobe collection CID）一律跳过。
+6. **许可**：OS/2 fsType bit1（Restricted License）默认不嵌入（C# 的 `__CannotEmbedded` 实际恒为 false，即不检查）；`--ignore-license` 可覆盖。
+7. **加密**：未给 `--password` -> 明确报错 "PDF is encrypted; supply the password with --password"（rc=1）；密码错误同理。输出为**解密后**的 PDF（未再加密）。
+8. **remove-fonts** 对标 `RemoveFonts` + `PdfRemoveFontsConverter` 谓词：删除 FontFile/2/3 条目（simple + 所有 DescendantFonts），`--min-size` = 仅删 **大于** N 字节者，`--subset yes|no`；`--large-pdf-rule` = OfficeUtility 的 "PDF >=10MB 才处理、字体 >=5MB 才删"。`only-system-fonts` 未移植（无 Utility.IsSystemFont），用 `--name-regex` 代替。
+9. **发现范围优于 C#**：C# `CollectFonts` 在 InternalUtility.cs:123 读错字典（用 page dict 而非 XObject dict），实际不递归 Form XObject，也忽略继承 /Resources；本实现递归 Form/Pattern/SMask/Annot AP(/N /D /R)/Type3 /Resources/AcroForm DR，沿 /Parent 取继承 Resources，按 objgen 记忆化 + 环保护（深度 50）。
+
+### 验证结果（证据）
+- 真实样本 `C:/test/IText7Test/PdfMerge/inputs`（18 个 PDF 含非嵌入字体：Helvetica/Times-Roman/Arial/Arial,Bold/Courier-Bold/ZapfDingbats/MinionPro-Regular）：用 Windows 系统字体（仅测试用；Wingdings/Garamond 只是 ZapfDingbats/Minion 的机制性替身）**非嵌入字体 49 -> 0**；pdftagvalicate 31-001 **8 个 Fail->Pass，0 个仍 Fail，其余 Pass 不变，无新 Fail/Error**；pdfium 前 3 页文本抽取前后一致。最大样本 4.6MB/49 页：0.66s、峰值 RSS 46MB（含解释器）。
+- CTS2.0 `LocalTest/CloudFonts/baseline.pdf`（6 个 subset 字体）：remove-fonts -> embed-fonts（CloudFonts 目录扫描 2217 文件约 4s）：4 个 simple 字体嵌入，渲染与 baseline 像素差 0.04%（去字体后 1.6%）；2 个 Type0 subset 字体因 GID 顺序与 CloudFonts 文件不同被**正确跳过**（/W 仅 18-23% 吻合）。`--remap-cid-via-tounicode` 在此仍拒绝（该 PDF 的 ToUnicode 只覆盖 8-18 个 CID，/W 复核失败）。
+- 真实 CFF OTF（CTS CustomFonts/AllspringSanomat）：simple -> Type1C、Type0 -> CIDFontType0C，pdfium 渲染出真实字形。
+
+### 未验证 / 已知缺口
+- **未验证**：pdfium 以外的查看器（Acrobat/Foxit）渲染；与 C# 在 CloudFonts 集成用例（0001.pptx -> PDF -> EmbedFont）上的对等（需要 Office/Foxit 环境，未运行）；PAC 对嵌入结果的判定（只验证了 pdftagvalicate 31-001）。
+- 缺口 vs C#：不做子集化（与 C# 相同，嵌入完整字体，输出明显变大，如 1KB -> 480KB）；去重只按 "相同 PS/Family/Style/类型"；无 `only-system-fonts`；Type3 不处理（本来内嵌）；.pfb 仅验证流结构（Length1/2/3），未做渲染验证；CFF2/可变字体不支持；Type0 + 预定义 CMap（CJK）不支持；多个候选字体并存时取目录顺序第一个（C# 同为 FirstOrDefault）；Bold->Regular 回退与 C# 一样不会合成粗体。

@@ -11,6 +11,9 @@ from pdfmergepy.merge import merge_files
 from pdfmergepy.mergeinfo import parse_merge_info
 from pdfmergepy.composite import merge_from_xml
 from pdfmergepy.partial import apply_partial_pdf_from_xml
+from pdfmergepy import fonts as fontlib
+from pdfmergepy.fontembed import embed_fonts
+from pdfmergepy.fontmap import FontCatalog
 from pdfmergepy import pageops
 from pdfmergepy.pdfutil import PageSpec, page_geometry, parse_input_arg, parse_page_range
 
@@ -79,6 +82,65 @@ def _cmd_merge_xml(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_list_fonts(args: argparse.Namespace) -> int:
+    with fontlib.open_pdf(args.input, args.password) as pdf:
+        result = fontlib.list_fonts(pdf)
+    if args.missing_only:
+        result = [f for f in result if not f["embedded"]]
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _build_catalog(args: argparse.Namespace) -> FontCatalog:
+    cat = FontCatalog()
+    for fm in args.font_map or []:
+        cat.add_font_map(fm)
+    for d in args.font_dir or []:
+        cat.add_directory(Path(d))
+    for f in args.font or []:
+        cat.add_named(f)
+    return cat
+
+
+def _cmd_embed_fonts(args: argparse.Namespace) -> int:
+    if not (args.font_map or args.font_dir or args.font):
+        print("error: give at least one of --font-map, --font-dir, --font", file=sys.stderr)
+        return 1
+    catalog = _build_catalog(args)
+    if not catalog.fonts:
+        print("error: no usable font files found", file=sys.stderr)
+        return 1
+    with fontlib.open_pdf(args.input, args.password) as pdf:
+        report = embed_fonts(pdf, catalog, strict=args.strict, ignore_license=args.ignore_license,
+                             allow_unverified_cid=args.allow_unverified_cid, remap_cid=args.remap_cid_via_tounicode)
+        pdf.save(args.output)
+    for w in report.warnings:
+        print(f"warning: {w}", file=sys.stderr)
+    if args.report:
+        text = json.dumps(report.to_json(), indent=2, ensure_ascii=False)
+        if args.report == "-":
+            print(text)
+        else:
+            Path(args.report).write_text(text, encoding="utf-8")
+    print(f"embed-fonts: {len(report.embedded)} of {report.candidates} non-embedded font(s) embedded, "
+          f"{report.remaining} remain -> {args.output}")
+    return 3 if (args.require_all and report.remaining) else 0
+
+
+def _cmd_remove_fonts(args: argparse.Namespace) -> int:
+    subset = {"yes": True, "no": False, None: None}[args.subset]
+    if args.large_pdf_rule:
+        pred = fontlib.large_font_predicate(Path(args.input).stat().st_size)
+    else:
+        pred = fontlib.make_remove_predicate(args.min_size, subset, args.name_regex)
+    with fontlib.open_pdf(args.input, args.password) as pdf:
+        removed = fontlib.remove_fonts(pdf, pred)
+        pdf.save(args.output)
+    freed = sum(r.size for r in removed)
+    print(f"remove-fonts: {len(removed)} embedded font file(s) removed ({freed} bytes) -> {args.output}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pdfmergepy",
@@ -128,6 +190,45 @@ def build_parser() -> argparse.ArgumentParser:
     partial_p.add_argument("-o", "--output", required=True, help="output PDF path")
     partial_p.set_defaults(func=_cmd_partial_merge)
 
+    lf = sub.add_parser("list-fonts", help="list every font used in a PDF as JSON (name, type, embedded?, subset?, where used)")
+    lf.add_argument("input", help="input PDF")
+    lf.add_argument("--password", default="", help="password for an encrypted PDF")
+    lf.add_argument("--missing-only", action="store_true", help="only list fonts that are not embedded")
+    lf.set_defaults(func=_cmd_list_fonts)
+
+    ef = sub.add_parser("embed-fonts", help="embed full font programs into non-embedded fonts (CTS2.0 EmbedFont equivalent)")
+    ef.add_argument("input", help="input PDF")
+    ef.add_argument("-o", "--output", required=True, help="output PDF path")
+    ef.add_argument("--font-map", action="append", metavar="MAP",
+                    help="font-map.json (CTS2.0 schema) or text form 'Name|path;Name|path'; repeatable")
+    ef.add_argument("--font-dir", action="append", metavar="DIR",
+                    help="directory of fonts (uses DIR/font-map.json when present, else scans *.ttf/otf/ttc/pfb); repeatable")
+    ef.add_argument("--font", action="append", metavar="NAME=PATH",
+                    help="use font file PATH for PDF fonts named NAME (PostScript or family name); repeatable")
+    ef.add_argument("--password", default="", help="password for an encrypted PDF")
+    ef.add_argument("--strict", action="store_true",
+                    help="only exact PostScript-name or exact family+style matches (no Bold->Regular style fallback)")
+    ef.add_argument("--ignore-license", action="store_true", help="embed even fonts whose OS/2 fsType forbids embedding")
+    ef.add_argument("--allow-unverified-cid", action="store_true",
+                    help="embed Type0 fonts even when CID==glyph-id cannot be verified from /W or /ToUnicode")
+    ef.add_argument("--remap-cid-via-tounicode", action="store_true",
+                    help="when a Type0 font's CIDs do not match the supplied TrueType font's glyph ids (e.g. a removed "
+                         "subset), rebuild /CIDToGIDMap from /ToUnicode instead of skipping the font")
+    ef.add_argument("--report", metavar="FILE", help="write a JSON report (embedded/skipped/warnings); '-' for stdout")
+    ef.add_argument("--require-all", action="store_true", help="exit 3 if any non-embedded font remains")
+    ef.set_defaults(func=_cmd_embed_fonts)
+
+    rf = sub.add_parser("remove-fonts", help="remove embedded font programs (CTS2.0 RemoveFonts equivalent)")
+    rf.add_argument("input", help="input PDF")
+    rf.add_argument("-o", "--output", required=True, help="output PDF path")
+    rf.add_argument("--min-size", type=int, default=0, metavar="BYTES",
+                    help="only remove font files larger than BYTES (C# 'size' option; 0 = no limit)")
+    rf.add_argument("--subset", choices=["yes", "no"], help="only remove subset (yes) / full (no) fonts")
+    rf.add_argument("--name-regex", help="only remove fonts whose name matches this regex (stand-in for C# only-system-fonts)")
+    rf.add_argument("--large-pdf-rule", action="store_true",
+                    help="CTS2.0 rule: do nothing unless the input PDF is >= 10 MB, then remove fonts >= 5 MB")
+    rf.add_argument("--password", default="", help="password for an encrypted PDF")
+    rf.set_defaults(func=_cmd_remove_fonts)
     # -- page operations (ports of CTS2.0 pdf split/select/delete, GetPageCount) --
     split_p = sub.add_parser("split", help="split into 0000.pdf, 0001.pdf... ('3,6' = 3 pages, 6 pages, rest)")
     split_p.add_argument("input")

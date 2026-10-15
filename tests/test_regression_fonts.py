@@ -140,3 +140,53 @@ def test_cloudfonts_baseline_remove_then_embed(tmp_path: Path):
             ra = a[i].render(scale=1.5, grayscale=True).to_numpy().astype(int)
             rb = b[i].render(scale=1.5, grayscale=True).to_numpy().astype(int)
             assert float((abs(ra - rb) > 64).mean()) < 0.005                         # <0.5% pixels differ (vs ~1.6% stripped)
+
+
+CTS_OTF = Path("C:/project_new/content-transformation-service-v2/src/IntegrationTest/test_suite/Documents/TestData/"
+               "CustomFonts/AllspringSanomat/Fonts/Allspring Sanomat-Bold.otf")
+
+
+@pytest.mark.skipif(not CTS_OTF.exists() or pdfium is None, reason="CTS2.0 CustomFonts OTF sample / pypdfium2 not available")
+def test_real_cff_otf_simple_and_cid(tmp_path: Path):
+    """A real CFF OpenType (CTS2.0 CustomFonts): simple font -> Type1C, Type0 -> CIDFontType0C; both render."""
+    from fontfactory import Array, Dictionary, Name, String, tounicode
+    tt = TTFont(str(CTS_OTF))
+    ps, cmap, order = tt["name"].getDebugName(6), tt.getBestCmap(), tt.getGlyphOrder()
+    text = "Hamburgefonts"
+    gids = [order.index(cmap[ord(c)]) for c in text]
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(400, 200))
+    simple = pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name("/" + ps),
+                                          Encoding=Name.WinAnsiEncoding))
+    w = []
+    for g in sorted(set(gids)):
+        w += [g, Array([round(tt["hmtx"][order[g]][0] * 1000 / tt["head"].unitsPerEm)])]
+    cid = Dictionary(Type=Name.Font, Subtype=Name.CIDFontType0, BaseFont=Name("/" + ps), W=Array(w),
+                     CIDSystemInfo=Dictionary(Registry=String("Adobe"), Ordering=String("Identity"), Supplement=0),
+                     FontDescriptor=pdf.make_indirect(Dictionary(Type=Name.FontDescriptor, FontName=Name("/" + ps), Flags=4)))
+    t0 = pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.Type0, BaseFont=Name("/" + ps), Encoding=Name("/Identity-H"),
+                                      DescendantFonts=Array([pdf.make_indirect(cid)])))
+    t0.ToUnicode = tounicode(pdf, dict(zip(gids, text)))
+    pg = pdf.pages[0]
+    pg.Resources = Dictionary(Font=Dictionary(F1=simple, F2=t0))
+    hexs = "<" + "".join("%04X" % g for g in gids) + ">"
+    pg.Contents = pdf.make_stream(f"BT /F1 36 Tf 10 130 Td ({text}) Tj ET BT /F2 36 Tf 10 60 Td {hexs} Tj ET".encode())
+    src, out = tmp_path / "s.pdf", tmp_path / "o.pdf"
+    pdf.save(src)
+    cat = FontCatalog()
+    cat.add_file(CTS_OTF)
+    with pikepdf.open(src) as p:
+        rep = embed_fonts(p, cat)
+        p.save(out)
+    assert len(rep.embedded) == 2 and rep.remaining == 0
+    with pikepdf.open(out) as p:
+        f = p.pages[0].Resources.Font
+        assert str(f.F1.FontDescriptor.FontFile3.Subtype) == "/Type1C"
+        assert str(f.F2.DescendantFonts[0].FontDescriptor.FontFile3.Subtype) == "/CIDFontType0C"
+    a = pdfium.PdfDocument(str(src))[0].render(scale=1, grayscale=True).to_numpy().astype(int)
+    b = pdfium.PdfDocument(str(out))[0].render(scale=1, grayscale=True).to_numpy().astype(int)
+    assert float((abs(a - b) > 64).mean()) > 0.001                      # real glyphs now differ from the fallback render
+    # both lines draw the same glyphs: top half (simple font) == bottom half (CID font), up to the y offset
+    assert pdfium.PdfDocument(str(out))[0].get_textpage().get_text_range().count("Hamburgefonts") == 2
+    rows = (b < 128).any(axis=1)
+    assert rows.sum() > 20

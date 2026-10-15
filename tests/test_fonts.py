@@ -691,3 +691,21 @@ def test_real_arial_embeds_and_parses(tmp_path):
         page = pdfium.PdfDocument(str(out))[0]
         txt = page.get_textpage().get_text_range()
         assert "Hello World" in txt
+
+
+@pytest.mark.skipif(pdfium is None, reason="pypdfium2/numpy not installed")
+def test_type0_mismatch_remapped_via_tounicode_renders_correctly(tmp_path):
+    d = tmp_path / "fonts"
+    d.mkdir()
+    make_font(d / "rev.ttf", "TestSans", "Regular", reverse=True)
+    src = _type0_pdf(tmp_path)
+    out = tmp_path / "o.pdf"
+    rep = _embed(src, out, _catalog_dir(d), remap_cid=True)
+    assert len(rep.embedded) == 1 and "rebuilt from /ToUnicode" in rep.embedded[0]["detail"]
+    with pikepdf.open(out) as pdf:
+        assert is_stream_obj(pdf.pages[0].Resources.Font.F1.DescendantFonts[0].CIDToGIDMap)
+    assert _dark_ratio(out, (22, 22, 46, 50)) > 0.95      # glyph A (solid box) now drawn from the supplied font
+
+
+def is_stream_obj(o):
+    return fl.is_stream(o)

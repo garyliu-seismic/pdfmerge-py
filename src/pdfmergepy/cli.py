@@ -111,7 +111,7 @@ def _cmd_embed_fonts(args: argparse.Namespace) -> int:
         return 1
     with fontlib.open_pdf(args.input, args.password) as pdf:
         report = embed_fonts(pdf, catalog, strict=args.strict, ignore_license=args.ignore_license,
-                             allow_unverified_cid=args.allow_unverified_cid)
+                             allow_unverified_cid=args.allow_unverified_cid, remap_cid=args.remap_cid_via_tounicode)
         pdf.save(args.output)
     for w in report.warnings:
         print(f"warning: {w}", file=sys.stderr)
@@ -210,6 +210,9 @@ def build_parser() -> argparse.ArgumentParser:
     ef.add_argument("--ignore-license", action="store_true", help="embed even fonts whose OS/2 fsType forbids embedding")
     ef.add_argument("--allow-unverified-cid", action="store_true",
                     help="embed Type0 fonts even when CID==glyph-id cannot be verified from /W or /ToUnicode")
+    ef.add_argument("--remap-cid-via-tounicode", action="store_true",
+                    help="when a Type0 font's CIDs do not match the supplied TrueType font's glyph ids (e.g. a removed "
+                         "subset), rebuild /CIDToGIDMap from /ToUnicode instead of skipping the font")
     ef.add_argument("--report", metavar="FILE", help="write a JSON report (embedded/skipped/warnings); '-' for stdout")
     ef.add_argument("--require-all", action="store_true", help="exit 3 if any non-embedded font remains")
     ef.set_defaults(func=_cmd_embed_fonts)

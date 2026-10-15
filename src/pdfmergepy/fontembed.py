@@ -358,6 +358,26 @@ def _build_simple_widths(font, loaded: _Loaded, symbolic: bool):
     font["/Widths"] = Array(widths)
 
 
+def _cid_to_gid_via_tounicode(loaded: _Loaded, font_obj) -> tuple[bytes | None, float]:
+    tu = font_obj.get("/ToUnicode")
+    if not is_stream(tu):
+        return None, 0.0
+    m = parse_tounicode(tu.read_bytes())
+    if not m:
+        return None, 0.0
+    cmap = loaded.tt.getBestCmap() or {}
+    order = {n: i for i, n in enumerate(loaded.tt.getGlyphOrder())}
+    table = bytearray(2 * (max(m) + 1))
+    hit = 0
+    for cid, u in m.items():
+        g = order.get(cmap.get(u))
+        if g is not None:
+            struct.pack_into(">H", table, 2 * cid, g)
+            hit += 1
+    cov = hit / len(m)
+    return (bytes(table), cov) if cov >= 0.9 else (None, cov)
+
+
 def _build_cid_widths(loaded: _Loaded) -> Array:
     n = len(loaded.tt.getGlyphOrder())
     w = Array()
@@ -425,7 +445,7 @@ def _pfb_stream(pdf, raw: bytes):
 # ---------------------------------------------------------------------------
 
 def embed_fonts(pdf: pikepdf.Pdf, catalog: FontCatalog, strict: bool = False, ignore_license: bool = False,
-                allow_unverified_cid: bool = False) -> EmbedReport:
+                allow_unverified_cid: bool = False, remap_cid: bool = False) -> EmbedReport:
     rep = EmbedReport()
     rep.warnings.extend(catalog.warnings)
     loaded_cache: dict[tuple, _Loaded] = {}
@@ -452,7 +472,7 @@ def embed_fonts(pdf: pikepdf.Pdf, catalog: FontCatalog, strict: bool = False, ig
             continue
         try:
             loaded = load(info)
-            ok, detail = _embed_one(pdf, df, loaded, allow_unverified_cid)
+            ok, detail = _embed_one(pdf, df, loaded, allow_unverified_cid, remap_cid)
         except Exception as ex:  # a broken font must not abort the document
             rep.skipped.append({**entry, "reason": f"error: {type(ex).__name__}: {ex}", "font": info.describe()})
             continue
@@ -473,13 +493,13 @@ def _clean_name(s: str) -> str:
     return re.sub(r"[\s()<>\[\]{}/%#]", "", s)
 
 
-def _embed_one(pdf, df: DocFont, loaded: _Loaded, allow_unverified_cid: bool) -> tuple[bool, str]:
+def _embed_one(pdf, df: DocFont, loaded: _Loaded, allow_unverified_cid: bool, remap_cid: bool = False) -> tuple[bool, str]:
     info = loaded.info
     font = df.obj
     new_name = _clean_name(info.ps_name)
 
     if df.subtype == "Type0":
-        return _embed_type0(pdf, df, loaded, new_name, allow_unverified_cid)
+        return _embed_type0(pdf, df, loaded, new_name, allow_unverified_cid, remap_cid)
 
     # ----- simple font -------------------------------------------------
     if info.kind == "cff" and info.cff_cid_keyed:
@@ -508,7 +528,8 @@ def _embed_one(pdf, df: DocFont, loaded: _Loaded, allow_unverified_cid: bool) ->
     return True, f"{key[1:]} ({stream.get('/Subtype') or 'raw'}) {len(loaded.raw)} bytes"
 
 
-def _embed_type0(pdf, df: DocFont, loaded: _Loaded, new_name: str, allow_unverified: bool) -> tuple[bool, str]:
+def _embed_type0(pdf, df: DocFont, loaded: _Loaded, new_name: str, allow_unverified: bool,
+                 remap_cid: bool = False) -> tuple[bool, str]:
     info = loaded.info
     font = df.obj
     dfont = df.descendant
@@ -528,7 +549,18 @@ def _embed_type0(pdf, df: DocFont, loaded: _Loaded, new_name: str, allow_unverif
     c2g = dfont.get("/CIDToGIDMap")
     c2g_bytes = c2g.read_bytes() if is_stream(c2g) else None
     verdict, detail = verify_cid_font(loaded, font, dfont, c2g_bytes)
-    if verdict == "mismatch":
+    new_c2g = None
+    if verdict == "mismatch" and remap_cid and info.kind == "truetype":
+        # The original CIDs are glyph ids of a *different* glyph order (typically a removed subset).
+        # Rebuild CID -> GID through /ToUnicode so the text keeps rendering with the supplied font.
+        new_c2g, cov = _cid_to_gid_via_tounicode(loaded, font)
+        if new_c2g is None:
+            return False, f"CID/GID mismatch and /ToUnicode remap impossible ({detail})"
+        v2, d2 = verify_cid_font(loaded, font, dfont, new_c2g)
+        if v2 == "mismatch":
+            return False, f"CID/GID mismatch; /ToUnicode remap did not reconcile /W ({detail} -> {d2})"
+        verdict, detail = "remapped", f"{detail}; CID->GID rebuilt from /ToUnicode, coverage {cov:.0%}, then {d2}"
+    elif verdict == "mismatch":
         return False, f"CID/GID mismatch: glyph order of the supplied font differs from the original ({detail})"
     if verdict == "unverified" and not allow_unverified:
         return False, f"CID/GID assumption unverifiable: {detail} (use --allow-unverified-cid to force)"
@@ -544,7 +576,9 @@ def _embed_type0(pdf, df: DocFont, loaded: _Loaded, new_name: str, allow_unverif
     if info.kind == "truetype":
         desc["/FontFile2"] = _font_stream(pdf, loaded, "FontFile2")
         dfont["/Subtype"] = Name.CIDFontType2
-        if c2g is None:
+        if new_c2g is not None:
+            dfont["/CIDToGIDMap"] = pdf.make_stream(new_c2g)
+        elif c2g is None:
             dfont["/CIDToGIDMap"] = Name.Identity
         label = "FontFile2"
     else:

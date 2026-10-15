@@ -56,11 +56,17 @@ def merge_files(specs: list[PageSpec], output: Path) -> None:
                 # Merge tag tree for each copied page (src still open → copy_foreign safe)
                 for n, src_idx in enumerate(page_indices):
                     dst_page_obj = dst.pages[dst_base + n].obj
-                    merge_page_tags(
+                    migrated = merge_page_tags(
                         src, dst, dst_page_obj,
                         src_page_index=src_idx,
                         src_path=spec.path,
                     )
+                    # No ParentTree entry was written for this page (untagged
+                    # source, or a page without marked content): a /StructParents
+                    # key (stale copy from the source, or an unused allocated
+                    # slot) would dangle, so drop it.
+                    if not migrated and "/StructParents" in dst_page_obj:
+                        del dst_page_obj["/StructParents"]
 
         # Match itext7's PdfMerger.cs, which explicitly declares 1.7
         # (WriterProperties().SetPdfVersion(PdfVersion.PDF_1_7)) rather than

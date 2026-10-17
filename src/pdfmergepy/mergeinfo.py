@@ -135,7 +135,7 @@ def parse_merge_info(path: Path) -> WorkspaceMergeInfo:
             slide_els = item_el.findall("slideLocalId")
 
         for sle in slide_els:
-            pdf_page = int(sle.get("pdfPage", "1"))
+            pdf_page = int(sle.get("pdfPage", "0"))  # C#: missing -> 0 -> plain copy
             slide_index = int(sle.get("slideIndex", "1"))
             try:
                 local_id = int((sle.text or "0").strip())
@@ -188,7 +188,8 @@ def resolve_external_page(
     """Return (pdf_path, 1-based page number) for this slide's external page.
 
     Logic (mirroring CTS2.0 PdfMerger.cs):
-    - If MergedPdfFileId is non-empty AND StartIndexInMergedFile >= 0:
+    - If MergedPdfFileId is non-empty AND StartIndexInMergedFile > 0 (strict,
+      as in C# PdfMerger.cs):
         use inputs_dir/<MergedPdfFileId>.pdf
         actual_page = StartIndexInMergedFile + slide.pdf_page
     - Else:
@@ -197,7 +198,7 @@ def resolve_external_page(
     """
     use_merged = (
         bool(item.merged_pdf_file_id)
-        and item.start_index_in_merged_file >= 0
+        and item.start_index_in_merged_file > 0
     )
 
     if use_merged:

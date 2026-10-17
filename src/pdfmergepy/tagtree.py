@@ -1268,3 +1268,133 @@ def _next_parent_tree_key(nums: pikepdf.Array, dst_root: pikepdf.Object) -> int:
     if hint is not None:
         return max(int(hint), actual_next)
     return actual_next
+
+
+# ---------------------------------------------------------------------------
+# Untagged overlay -> single <Figure> with Alt (PartialPdfMerger fallback)
+# ---------------------------------------------------------------------------
+
+DEFAULT_ALT = "Embedded PDF page"
+MAX_ALT_LENGTH = 250
+
+
+def _sanitize_alt(text: str) -> str:
+    text = " ".join(text.split())
+    return text[:MAX_ALT_LENGTH]
+
+
+def build_alt_text(src: Optional[pikepdf.Pdf]) -> str:
+    """Alt text for an untagged overlay (ports ``PartialPdfMerger.BuildAltText``).
+
+    Fallback chain: first non-empty /Alt or /ActualText found breadth-first in
+    the source struct tree, then ``"Embedded PDF: <Title>"``, then a default.
+    (The C# page-text-extraction step is not ported; pikepdf has no text
+    extractor.)  Never returns an empty string, as PDF/UA-1 requires.
+    """
+    if src is None:
+        return DEFAULT_ALT
+    try:
+        root = src.Root.get("/StructTreeRoot")
+        if root is not None:
+            queue = [root]
+            seen: set = set()
+            while queue:
+                node = queue.pop(0)
+                if not hasattr(node, "get"):
+                    continue
+                key = getattr(node, "objgen", None) or id(node)
+                if key in seen:
+                    continue
+                seen.add(key)
+                for name in ("/Alt", "/ActualText"):
+                    v = node.get(name)
+                    if v is not None and str(v).strip():
+                        return _sanitize_alt(str(v))
+                k = node.get("/K")
+                if isinstance(k, pikepdf.Array):
+                    queue.extend(k)
+                elif k is not None:
+                    queue.append(k)
+    except Exception as exc:
+        log.warning("build_alt_text: tag-tree scan failed: %s", exc)
+    try:
+        title = src.docinfo.get("/Title")
+        if title is not None and str(title).strip():
+            return _sanitize_alt("Embedded PDF: " + str(title))
+    except Exception:
+        pass
+    return DEFAULT_ALT
+
+
+def _find_parent_tree_array(
+    node: pikepdf.Object, key: int
+) -> "pikepdf.Object | None":
+    """Return the /Nums value array stored under *key* (flat or /Kids tree)."""
+    nums = node.get("/Nums")
+    if nums is not None:
+        for i in range(0, len(nums) - 1, 2):
+            if int(nums[i]) == key:
+                v = nums[i + 1]
+                return v if isinstance(v, pikepdf.Array) else None
+        return None
+    for kid in node.get("/Kids", []) or []:
+        limits = kid.get("/Limits")
+        if limits is not None and not (int(limits[0]) <= key <= int(limits[1])):
+            continue
+        found = _find_parent_tree_array(kid, key)
+        if found is not None:
+            return found
+    return None
+
+
+def reserve_figure_mcid(
+    dst: pikepdf.Pdf, dst_page_obj: pikepdf.Object, alt: str
+) -> Optional[int]:
+    """Create a ``<Figure Alt=...>`` struct element for a new marked-content
+    sequence on *dst_page_obj* and return the MCID to use in ``BDC``.
+
+    The Figure is attached under the struct element owning the page (else the
+    ``<Document>``), and registered in the page's /ParentTree array.  Returns
+    ``None`` when *dst* is not tagged (nothing is written in that case).
+    """
+    if not _is_tagged(dst):
+        return None
+    root = dst.Root["/StructTreeRoot"]
+
+    used: set[int] = set()
+    _extract_mcids_from_page(dst_page_obj, used)
+
+    pt = root.get("/ParentTree")
+    arr = None
+    sp = dst_page_obj.get("/StructParents")
+    if sp is not None and pt is not None:
+        arr = _find_parent_tree_array(pt, int(sp))
+    if sp is not None and arr is None:
+        # StructParents points nowhere usable; allocate a fresh slot below.
+        sp = None
+
+    mcid = max(max(used) + 1 if used else 0, len(arr) if arr is not None else 0)
+
+    parent = _resolve_dest_attach(root, dst, dst_page_obj)
+    figure = dst.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name("/StructElem"),
+        S=pikepdf.Name("/Figure"),
+        P=parent,
+        Pg=dst_page_obj,
+        K=pikepdf.Integer(mcid),
+        Alt=pikepdf.String(alt),
+    ))
+    _append_kid(parent, figure)
+
+    if arr is None:
+        slot = _alloc_parent_tree_slot(root, dst_page_obj)
+        arr = pikepdf.Array([None] * mcid)
+        _write_parent_tree_slot(root, slot, [])
+        # replace the empty array just written with ours (kept as the same object)
+        nums = root["/ParentTree"]["/Nums"]
+        nums[len(nums) - 1] = arr
+        arr = nums[len(nums) - 1]
+    while len(arr) < mcid:
+        arr.append(None)
+    arr.append(figure)
+    return mcid

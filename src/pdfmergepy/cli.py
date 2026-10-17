@@ -10,7 +10,7 @@ import pikepdf
 from pdfmergepy.merge import merge_files
 from pdfmergepy.mergeinfo import parse_merge_info
 from pdfmergepy.composite import merge_from_xml
-from pdfmergepy.partial import apply_partial_pdf_from_xml
+from pdfmergepy.partial import apply_partial_pdf_from_xml, merge_xml_then_partial
 from pdfmergepy import fonts as fontlib
 from pdfmergepy.fontembed import embed_fonts
 from pdfmergepy.fontmap import FontCatalog
@@ -73,10 +73,9 @@ def _cmd_merge_xml(args: argparse.Namespace) -> int:
         print(f"error: inputs directory not found: {inputs_dir}", file=sys.stderr)
         return 1
 
-    merge_info = parse_merge_info(xml_path)
-    merge_from_xml(merge_info, main_path, inputs_dir, output_path)
+    n_merge, n_partial = merge_xml_then_partial(xml_path, main_path, inputs_dir, output_path)
     print(
-        f"merge-xml: {len(merge_info.merge_items)} MergeItem(s) "
+        f"merge-xml: {n_merge} MergeItem(s), {n_partial} partialPDF entry/entries "
         f"-> {output_path}"
     )
     return 0
@@ -166,7 +165,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     xml_p = sub.add_parser(
         "merge-xml",
-        help="merge PDFs according to a WorkspaceMergeInfo XML file (CTS2.0 format)",
+        help="merge PDFs according to a WorkspaceMergeInfo XML file (CTS2.0 format); runs <PDFMerge> then <partialPDF> if both are present",
     )
     xml_p.add_argument("xml", help="path to WorkspaceMergeInfo XML file")
     xml_p.add_argument("--main", required=True, help="path to main/base PDF")

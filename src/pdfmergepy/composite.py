@@ -9,6 +9,7 @@ Both modes use Form XObject compositing via pikepdf content-stream manipulation.
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Optional
@@ -29,6 +30,8 @@ from pdfmergepy.mergeinfo import (
     WorkspaceMergeInfo,
     resolve_external_page,
 )
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +523,9 @@ def _merge_fit_main_size(
         if main_mb is not None:
             # Reconstruct as fresh Array to avoid foreign-object copy issues
             new_page_obj["/MediaBox"] = pikepdf.Array([float(v) for v in main_mb])
+            # C# sets CropBox to the same rect; a stale external /CropBox would
+            # otherwise clip the overlay (viewers use MediaBox ∩ CropBox).
+            new_page_obj["/CropBox"] = pikepdf.Array([float(v) for v in main_mb])
 
     # Step 3-4: compute transform matrix
     matrix = _compute_fit_main_matrix(main_page_obj, ext_page_obj)
@@ -582,7 +588,9 @@ def merge_from_xml(
     slide_map: dict[int, tuple[MergeItem, SlideLocalId]] = {}
     for item in merge_info.merge_items:
         for slide in item.slides:
-            slide_map[slide.slide_index] = (item, slide)
+            # C#: first matching MergeItem wins; pdfPage <= 0 means plain copy.
+            if slide.pdf_page > 0:
+                slide_map.setdefault(slide.slide_index, (item, slide))
 
     with pikepdf.open(main_pdf_path) as main_pdf:
         n_main = len(main_pdf.pages)
@@ -599,18 +607,40 @@ def merge_from_xml(
                     _open_ext[path] = ext_stack.enter_context(pikepdf.open(path))
                 return _open_ext[path]
 
-            for slide_idx in range(1, n_main + 1):
+            # The main PDF already excludes hidden slides (as in C#
+            # PdfMerger.cs: totalPage = infoList.Count; page index =
+            # slide - hiddenBefore), so slide numbering comes from SlideInfo.
+            total_slides = len(merge_info.slide_infos) or (
+                n_main + len(hidden_slides)
+            )
+            hidden_before = 0
+            for slide_idx in range(1, total_slides + 1):
                 if slide_idx in hidden_slides:
+                    hidden_before += 1
                     continue
 
-                main_page = main_pdf.pages[slide_idx - 1]
+                main_page_index = slide_idx - hidden_before - 1
+                if main_page_index >= n_main:
+                    log.warning(
+                        "slide %d maps to main page %d but main PDF has %d pages; skipped",
+                        slide_idx, main_page_index + 1, n_main,
+                    )
+                    continue
+                main_page = main_pdf.pages[main_page_index]
 
+                resolved = None
                 if slide_idx in slide_map:
                     item, slide_local_id = slide_map[slide_idx]
-                    ext_path, ext_page_num = resolve_external_page(
-                        item, slide_local_id, inputs_dir
-                    )
+                    try:
+                        ext_path, ext_page_num = resolve_external_page(
+                            item, slide_local_id, inputs_dir
+                        )
+                        resolved = True
+                    except FileNotFoundError as exc:
+                        # C#: a missing reader means the main page is copied as-is.
+                        log.warning("slide %d: %s; copying main page as-is", slide_idx, exc)
 
+                if resolved:
                     ext_pdf = _get_ext_pdf(ext_path)
                     if ext_page_num < 1 or ext_page_num > len(ext_pdf.pages):
                         raise ValueError(
@@ -621,7 +651,6 @@ def merge_from_xml(
                     # ext_page_num is 1-based; add_page_with_forms needs 0-based
                     ext_page_index = ext_page_num - 1
 
-                    main_page_index = slide_idx - 1
                     if item.fit_pdf_size:
                         _merge_fit_pdf_size(
                             main_page.obj, ext_page.obj, dst, item,
@@ -643,12 +672,12 @@ def merge_from_xml(
                 else:
                     # Plain copy: AcroForm fields + tag tree from main PDF.
                     add_page_with_forms(
-                        dst, main_pdf, slide_idx - 1, src_path=main_pdf_path
+                        dst, main_pdf, main_page_index, src_path=main_pdf_path
                     )
                     # Tag-tree merge: main_pdf still open → copy_foreign safe
                     merge_page_tags(
                         main_pdf, dst, dst.pages[-1].obj,
-                        src_page_index=slide_idx - 1,
+                        src_page_index=main_page_index,
                         src_path=main_pdf_path,
                     )
 

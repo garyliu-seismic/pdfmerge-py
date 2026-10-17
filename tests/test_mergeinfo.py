@@ -520,3 +520,136 @@ def test_compute_fit_main_matrix_with_cropbox(tmp_path: Path) -> None:
     # f = bottom - scale*crop_y0 = 0 - 2*300 = -600
     assert abs(m[4]) < 1e-6, f"e={m[4]}, expected 0"
     assert abs(m[5] - (-600.0)) < 1e-6, f"f={m[5]}, expected -600"
+
+
+def test_merge_xml_hidden_slide_maps_to_shifted_main_page(tmp_path: Path) -> None:
+    """Slide 3 (after hidden slide 2) is the 2nd page of the hidden-free main PDF."""
+    main_pdf_path = tmp_path / "main.pdf"
+    ext_pdf_path = tmp_path / "blob-test.pdf"
+    output_path = tmp_path / "output.pdf"
+    _make_pdf(main_pdf_path, 2, width=960, height=540)
+    _make_pdf(ext_pdf_path, 1, width=300, height=300)
+    xml_path = tmp_path / "merge.xml"
+    _write_xml(xml_path, """<?xml version="1.0" encoding="utf-16"?>
+<WorkspaceMergeInfo>
+  <PDFMerge>
+    <MergeItem FitPDFSize="true" SlideFitPattern="AlignTopLeft" pageCount="1"
+               id="test-item" BlobId="blob-test">
+      <MergedPdfFileInfo MergedPdfFileId="" StartIndexInMergedFile="-1" />
+      <slideLocalId pdfPage="1" slideIndex="3">30</slideLocalId>
+    </MergeItem>
+  </PDFMerge>
+  <SlideInfo>
+    <info slideIndex="1" localId="10" hidden="false" />
+    <info slideIndex="2" localId="20" hidden="true" />
+    <info slideIndex="3" localId="30" hidden="false" />
+  </SlideInfo>
+</WorkspaceMergeInfo>
+""")
+    merge_from_xml(parse_merge_info(xml_path), main_pdf_path, tmp_path, output_path)
+    with pikepdf.open(output_path) as out:
+        assert len(out.pages) == 2
+        # page 1 is a plain copy (no XObjects); page 2 carries the overlay
+        assert not (out.pages[0].obj.get("/Resources") or {}).get("/XObject")
+        assert len(out.pages[1].obj["/Resources"]["/XObject"].keys()) >= 1
+
+
+def test_merge_xml_mode_a_resets_external_cropbox(tmp_path: Path) -> None:
+    """Mode A: a stale external /CropBox must not clip the overlay."""
+    main_pdf_path = tmp_path / "main.pdf"
+    ext_pdf_path = tmp_path / "blob-test.pdf"
+    output_path = tmp_path / "output.pdf"
+    _make_pdf(main_pdf_path, 1, width=200, height=200)
+    _make_pdf(ext_pdf_path, 1, width=400, height=300)
+    with pikepdf.open(ext_pdf_path, allow_overwriting_input=True) as e:
+        e.pages[0].obj["/CropBox"] = pikepdf.Array([50, 50, 350, 250])
+        e.save(ext_pdf_path)
+    xml_path = tmp_path / "merge.xml"
+    _write_xml(xml_path, """<?xml version="1.0" encoding="utf-16"?>
+<WorkspaceMergeInfo>
+  <PDFMerge>
+    <MergeItem FitPDFSize="false" SlideFitPattern="AlignTopLeft" pageCount="1"
+               id="test-item" BlobId="blob-test">
+      <MergedPdfFileInfo MergedPdfFileId="" StartIndexInMergedFile="-1" />
+      <slideLocalId pdfPage="1" slideIndex="1">10</slideLocalId>
+    </MergeItem>
+  </PDFMerge>
+  <SlideInfo>
+    <info slideIndex="1" localId="10" hidden="false" />
+  </SlideInfo>
+</WorkspaceMergeInfo>
+""")
+    merge_from_xml(parse_merge_info(xml_path), main_pdf_path, tmp_path, output_path)
+    with pikepdf.open(output_path) as out:
+        pg = out.pages[0].obj
+        assert [float(v) for v in pg.MediaBox] == [0, 0, 200, 200]
+        assert [float(v) for v in pg.CropBox] == [0, 0, 200, 200]
+
+
+_CHAIN_XML = """\
+<?xml version="1.0" encoding="utf-16"?>
+<WorkspaceMergeInfo>
+  <PDFMerge>
+    <MergeItem FitPDFSize="true" SlideFitPattern="AlignTopLeft" pageCount="1"
+               id="i1" BlobId="{blob}">
+      <MergedPdfFileInfo MergedPdfFileId="" StartIndexInMergedFile="-1" />
+      <slideLocalId pdfPage="1" slideIndex="1">10</slideLocalId>
+    </MergeItem>
+  </PDFMerge>
+  <partialPDF>
+    <info blob-id="part" content-control="FitBoth" horizontal-alignment="Left" vertical-alignment="Top">
+      <ParentType>Slide</ParentType><SlideIndex>2</SlideIndex>
+      <x>10</x><y>10</y><extCX>100</extCX><extCY>100</extCY>
+      <rotation>0</rotation><z-index>0</z-index>
+    </info>
+  </partialPDF>
+  <SlideInfo>
+    <info slideIndex="1" localId="10" hidden="false" />
+    <info slideIndex="2" localId="20" hidden="false" />
+  </SlideInfo>
+</WorkspaceMergeInfo>
+"""
+
+
+def test_merge_xml_chains_pdfmerge_then_partial(tmp_path: Path) -> None:
+    from pdfmergepy.cli import main as cli_main
+    _make_pdf(tmp_path / "main.pdf", 2, width=960, height=540)
+    _make_pdf(tmp_path / "blob1.pdf", 1, width=960, height=540)
+    _make_pdf(tmp_path / "part.pdf", 1, width=100, height=100)
+    xml = tmp_path / "m.xml"
+    _write_xml(xml, _CHAIN_XML.format(blob="blob1"))
+    out = tmp_path / "out.pdf"
+    rc = cli_main(["merge-xml", str(xml), "--main", str(tmp_path / "main.pdf"),
+                   "--inputs-dir", str(tmp_path), "-o", str(out)])
+    assert rc == 0
+    with pikepdf.open(out) as pdf:
+        assert len(pdf.pages) == 2
+        # slide 1: Mode B overlay (merge step); slide 2: partial overlay
+        assert len(pdf.pages[0].obj["/Resources"]["/XObject"].keys()) >= 1
+        assert any(k.startswith("/PXobj") for k in pdf.pages[1].obj["/Resources"]["/XObject"].keys())
+        from tagcheck import tag_problems
+        assert sum(tag_problems(pdf).values()) == 0
+    assert not list(tmp_path.glob("tmp*.pdf"))
+
+
+def test_merge_xml_missing_blob_copies_main_page(tmp_path: Path) -> None:
+    _make_pdf(tmp_path / "main.pdf", 1, width=960, height=540)
+    xml = tmp_path / "m.xml"
+    _write_xml(xml, _CHAIN_XML.format(blob="nope").split("<partialPDF>")[0]
+               + "</WorkspaceMergeInfo>")
+    out = tmp_path / "out.pdf"
+    merge_from_xml(parse_merge_info(xml), tmp_path / "main.pdf", tmp_path, out)
+    with pikepdf.open(out) as pdf:
+        assert len(pdf.pages) == 1
+        assert not (pdf.pages[0].obj.get("/Resources") or {}).get("/XObject")
+
+
+def test_resolve_start_index_zero_uses_blob(tmp_path: Path) -> None:
+    from pdfmergepy.mergeinfo import MergeItem, SlideLocalId, resolve_external_page
+    (tmp_path / "blob.pdf").write_bytes(b"x")
+    (tmp_path / "merged.pdf").write_bytes(b"x")
+    item = MergeItem(id="i", blob_id="blob", fit_pdf_size=True, slide_fit_pattern="",
+                     page_count=1, merged_pdf_file_id="merged",
+                     start_index_in_merged_file=0, slides=[])
+    path, page = resolve_external_page(item, SlideLocalId(pdf_page=2, slide_index=1, local_id=1), tmp_path)
+    assert path.name == "blob.pdf" and page == 2

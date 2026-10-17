@@ -1388,13 +1388,13 @@ def reserve_figure_mcid(
 
     if arr is None:
         slot = _alloc_parent_tree_slot(root, dst_page_obj)
-        arr = pikepdf.Array([pikepdf.Null()] * mcid)
+        arr = pikepdf.Array([None] * mcid)
         _write_parent_tree_slot(root, slot, [])
         # replace the empty array just written with ours (kept as the same object)
         nums = root["/ParentTree"]["/Nums"]
         nums[len(nums) - 1] = arr
         arr = nums[len(nums) - 1]
     while len(arr) < mcid:
-        arr.append(pikepdf.Null())
+        arr.append(None)
     arr.append(figure)
     return mcid

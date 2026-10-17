@@ -584,3 +584,72 @@ def test_merge_xml_mode_a_resets_external_cropbox(tmp_path: Path) -> None:
         pg = out.pages[0].obj
         assert [float(v) for v in pg.MediaBox] == [0, 0, 200, 200]
         assert [float(v) for v in pg.CropBox] == [0, 0, 200, 200]
+
+
+_CHAIN_XML = """\
+<?xml version="1.0" encoding="utf-16"?>
+<WorkspaceMergeInfo>
+  <PDFMerge>
+    <MergeItem FitPDFSize="true" SlideFitPattern="AlignTopLeft" pageCount="1"
+               id="i1" BlobId="{blob}">
+      <MergedPdfFileInfo MergedPdfFileId="" StartIndexInMergedFile="-1" />
+      <slideLocalId pdfPage="1" slideIndex="1">10</slideLocalId>
+    </MergeItem>
+  </PDFMerge>
+  <partialPDF>
+    <info blob-id="part" content-control="FitBoth" horizontal-alignment="Left" vertical-alignment="Top">
+      <ParentType>Slide</ParentType><SlideIndex>2</SlideIndex>
+      <x>10</x><y>10</y><extCX>100</extCX><extCY>100</extCY>
+      <rotation>0</rotation><z-index>0</z-index>
+    </info>
+  </partialPDF>
+  <SlideInfo>
+    <info slideIndex="1" localId="10" hidden="false" />
+    <info slideIndex="2" localId="20" hidden="false" />
+  </SlideInfo>
+</WorkspaceMergeInfo>
+"""
+
+
+def test_merge_xml_chains_pdfmerge_then_partial(tmp_path: Path) -> None:
+    from pdfmergepy.cli import main as cli_main
+    _make_pdf(tmp_path / "main.pdf", 2, width=960, height=540)
+    _make_pdf(tmp_path / "blob1.pdf", 1, width=960, height=540)
+    _make_pdf(tmp_path / "part.pdf", 1, width=100, height=100)
+    xml = tmp_path / "m.xml"
+    _write_xml(xml, _CHAIN_XML.format(blob="blob1"))
+    out = tmp_path / "out.pdf"
+    rc = cli_main(["merge-xml", str(xml), "--main", str(tmp_path / "main.pdf"),
+                   "--inputs-dir", str(tmp_path), "-o", str(out)])
+    assert rc == 0
+    with pikepdf.open(out) as pdf:
+        assert len(pdf.pages) == 2
+        # slide 1: Mode B overlay (merge step); slide 2: partial overlay
+        assert len(pdf.pages[0].obj["/Resources"]["/XObject"].keys()) >= 1
+        assert any(k.startswith("/PXobj") for k in pdf.pages[1].obj["/Resources"]["/XObject"].keys())
+        from tagcheck import tag_problems
+        assert sum(tag_problems(pdf).values()) == 0
+    assert not list(tmp_path.glob("tmp*.pdf"))
+
+
+def test_merge_xml_missing_blob_copies_main_page(tmp_path: Path) -> None:
+    _make_pdf(tmp_path / "main.pdf", 1, width=960, height=540)
+    xml = tmp_path / "m.xml"
+    _write_xml(xml, _CHAIN_XML.format(blob="nope").split("<partialPDF>")[0]
+               + "</WorkspaceMergeInfo>")
+    out = tmp_path / "out.pdf"
+    merge_from_xml(parse_merge_info(xml), tmp_path / "main.pdf", tmp_path, out)
+    with pikepdf.open(out) as pdf:
+        assert len(pdf.pages) == 1
+        assert not (pdf.pages[0].obj.get("/Resources") or {}).get("/XObject")
+
+
+def test_resolve_start_index_zero_uses_blob(tmp_path: Path) -> None:
+    from pdfmergepy.mergeinfo import MergeItem, SlideLocalId, resolve_external_page
+    (tmp_path / "blob.pdf").write_bytes(b"x")
+    (tmp_path / "merged.pdf").write_bytes(b"x")
+    item = MergeItem(id="i", blob_id="blob", fit_pdf_size=True, slide_fit_pattern="",
+                     page_count=1, merged_pdf_file_id="merged",
+                     start_index_in_merged_file=0, slides=[])
+    path, page = resolve_external_page(item, SlideLocalId(pdf_page=2, slide_index=1, local_id=1), tmp_path)
+    assert path.name == "blob.pdf" and page == 2

@@ -700,8 +700,56 @@ def apply_partial_pdf_from_xml(
 
     Returns the number of partial-PDF entries applied.
     """
+    from .mergeinfo import parse_merge_info
+
     infos = parse_partial_pdf_info(xml_path)
     if not infos:
         log.warning("apply_partial_pdf_from_xml: no <partialPDF> entries in %s", xml_path)
-    apply_partial_pdf(infos, main_pdf_path, inputs_dir, output_path)
+    # The main PDF excludes hidden slides, so slide -> page mapping needs them.
+    hidden = {
+        si.slide_index for si in parse_merge_info(xml_path).slide_infos if si.hidden
+    }
+    apply_partial_pdf(infos, main_pdf_path, inputs_dir, output_path,
+                      hidden_slide_indices=hidden)
     return len(infos)
+
+
+def merge_xml_then_partial(
+    xml_path: Path,
+    main_pdf_path: Path,
+    inputs_dir: Path,
+    output_path: Path,
+) -> tuple[int, int]:
+    """Run ``<PDFMerge>`` then ``<partialPDF>`` from one XML (C# order:
+    MergeNew, then MergeAll).  Returns ``(merge_item_count, partial_count)``.
+    """
+    import os
+    import tempfile
+
+    from .composite import merge_from_xml
+    from .mergeinfo import parse_merge_info
+
+    merge_info = parse_merge_info(xml_path)
+    infos = parse_partial_pdf_info(xml_path)
+    n_merge = len(merge_info.merge_items)
+
+    if not infos:
+        merge_from_xml(merge_info, main_pdf_path, inputs_dir, output_path)
+        return n_merge, 0
+    if n_merge == 0 and not merge_info.slide_infos:
+        apply_partial_pdf_from_xml(xml_path, main_pdf_path, inputs_dir, output_path)
+        return 0, len(infos)
+
+    fd, tmp_name = tempfile.mkstemp(suffix=".pdf", dir=str(output_path.parent or "."))
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        merge_from_xml(merge_info, main_pdf_path, inputs_dir, tmp)
+        # Merged output already excludes hidden slides; partial maps slide
+        # indices through the same hidden set.
+        hidden = {si.slide_index for si in merge_info.slide_infos if si.hidden}
+        apply_partial_pdf(infos, tmp, inputs_dir, output_path,
+                          hidden_slide_indices=hidden)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return n_merge, len(infos)

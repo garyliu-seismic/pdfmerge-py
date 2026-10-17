@@ -485,3 +485,81 @@ def test_cli_partial_merge(tmp_path: Path) -> None:
     assert out.exists()
     with pikepdf.open(out) as pdf:
         assert len(pdf.pages) > 0
+
+
+# ---------------------------------------------------------------------------
+# 17. G1 — main PDF is preserved; untagged overlay gets <Figure Alt=...>
+# ---------------------------------------------------------------------------
+
+def _ov_info(slide: int = 1) -> PartialPdfInfo:
+    return PartialPdfInfo(
+        blob_id="ext", slide_index=slide,
+        x=10.0, y=20.0, ext_cx=100.0, ext_cy=100.0,
+        rotation=0.0, z_index=0,
+        content_control="FitBoth", h_align="Left", v_align="Top",
+    )
+
+
+def test_partial_preserves_main_document(tmp_path: Path) -> None:
+    from tests.pdfbuilder import build_pdf
+    main = build_pdf(tmp_path / "main.pdf", n=3)
+    ext = tmp_path / "ext.pdf"
+    out = tmp_path / "out.pdf"
+    _make_blank_pdf(ext, pages=1, w=100, h=100)
+
+    with pikepdf.open(main) as src:
+        keys_before = set(src.Root.keys())
+        sp_before = [p.obj.get("/StructParents") for p in src.pages]
+    apply_partial_pdf([_ov_info()], main, tmp_path, out)
+
+    with pikepdf.open(out) as pdf:
+        assert keys_before <= set(pdf.Root.keys())
+        assert str(pdf.Root.Lang) == "en-US"
+        assert [p.obj.get("/StructParents") for p in pdf.pages] == sp_before
+
+
+def test_partial_untagged_overlay_becomes_figure_with_alt(tmp_path: Path) -> None:
+    from tests.pdfbuilder import build_pdf
+    from tests.tagcheck import tag_problems
+    main = build_pdf(tmp_path / "main.pdf", n=2)
+    ext = tmp_path / "ext.pdf"
+    out = tmp_path / "out.pdf"
+    _make_blank_pdf(ext, pages=1, w=100, h=100)
+    with pikepdf.open(ext, allow_overwriting_input=True) as e:
+        e.docinfo["/Title"] = "Chart Deck"
+        e.save(ext)
+
+    apply_partial_pdf([_ov_info(1)], main, tmp_path, out)
+
+    with pikepdf.open(out) as pdf:
+        assert sum(tag_problems(pdf).values()) == 0
+        page = pdf.pages[0].obj
+        data = b"".join(c.read_bytes() for c in page["/Contents"])
+        assert b"/Figure <</MCID 2>> BDC" in data      # MCIDs 0,1 already used
+        figs = []
+
+        def walk(n):
+            if not hasattr(n, "get"):
+                return
+            if n.get("/S") == "/Figure":
+                figs.append(n)
+            k = n.get("/K")
+            for kid in (list(k) if isinstance(k, pikepdf.Array) else [k] if k is not None else []):
+                walk(kid)
+        walk(pdf.Root.StructTreeRoot)
+        assert len(figs) == 1
+        assert str(figs[0].Alt) == "Embedded PDF: Chart Deck"
+        assert int(figs[0].K) == 2
+        # page 2 untouched
+        assert b"/Figure" not in pdf.pages[1].obj["/Contents"].read_bytes()
+
+
+def test_partial_untagged_main_stays_untagged(tmp_path: Path) -> None:
+    main = tmp_path / "main.pdf"
+    ext = tmp_path / "ext.pdf"
+    out = tmp_path / "out.pdf"
+    _make_blank_pdf(main, pages=1)
+    _make_blank_pdf(ext, pages=1, w=100, h=100)
+    apply_partial_pdf([_ov_info()], main, tmp_path, out)
+    with pikepdf.open(out) as pdf:
+        assert "/StructTreeRoot" not in pdf.Root

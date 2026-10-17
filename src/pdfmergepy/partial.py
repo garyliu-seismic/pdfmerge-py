@@ -74,6 +74,13 @@ from typing import Optional
 
 import pikepdf
 
+from .tagtree import (
+    _is_tagged,
+    build_alt_text,
+    migrate_tags_for_xobject,
+    reserve_figure_mcid,
+)
+
 log = logging.getLogger(__name__)
 
 PRODUCER = "pdfmergepy (pikepdf/QPDF)"
@@ -489,8 +496,15 @@ def _append_xobject_to_page(
     xobj: pikepdf.Object,
     xobj_name: str,
     matrix: list[float],
+    *,
+    figure_mcid: Optional[int] = None,
+    alt: str = "",
 ) -> None:
-    """Append a content stream that draws *xobj* with *matrix* onto *dst_page_obj*."""
+    """Append a content stream that draws *xobj* with *matrix* onto *dst_page_obj*.
+
+    With *figure_mcid* the draw is wrapped in a ``/Figure`` marked-content
+    sequence (``BDC``/``EMC``) so it can be tied to a ``<Figure>`` struct elem.
+    """
     if "/Resources" not in dst_page_obj:
         dst_page_obj["/Resources"] = pikepdf.Dictionary()
     res = dst_page_obj["/Resources"]
@@ -500,7 +514,10 @@ def _append_xobject_to_page(
 
     a, b, c, d, e, f = matrix
     m_str = f"{a:.6f} {b:.6f} {c:.6f} {d:.6f} {e:.6f} {f:.6f}"
-    draw = f"\nq {m_str} cm\nq\n{xobj_name} Do\nQ\nQ\n".encode()
+    body = f"q {m_str} cm\nq\n{xobj_name} Do\nQ\nQ\n"
+    if figure_mcid is not None:
+        body = f"/Figure <</MCID {figure_mcid}>> BDC\n{body}EMC\n"
+    draw = ("\n" + body).encode()
 
     new_stream = dst.make_stream(draw)
     existing = dst_page_obj.get("/Contents")
@@ -573,82 +590,98 @@ def apply_partial_pdf(
             return None
         return slide_idx - hidden_before
 
-    with pikepdf.open(main_pdf_path) as main_pdf, contextlib.ExitStack() as stack:
-        with pikepdf.Pdf.new() as dst:
-            dst.pages.extend(main_pdf.pages)
-            try:
-                dst.docinfo.update(main_pdf.docinfo)
-            except Exception:
-                pass
-            dst.docinfo["/Producer"] = PRODUCER
+    # Edit the main PDF in place (like iText's stamping mode) so the whole
+    # document - /Lang, /MarkInfo, /StructTreeRoot, /Outlines, /Names,
+    # /PageLabels, page /StructParents - survives; only overlays are added.
+    with pikepdf.open(main_pdf_path, allow_overwriting_input=True) as main_pdf,             contextlib.ExitStack() as stack:
+        dst = main_pdf
+        dst.docinfo["/Producer"] = PRODUCER
 
-            _open_ext: dict[Path, pikepdf.Pdf] = {}
+        _open_ext: dict[Path, pikepdf.Pdf] = {}
 
-            def _get_ext(path: Path) -> pikepdf.Pdf:
-                if path not in _open_ext:
-                    _open_ext[path] = stack.enter_context(pikepdf.open(path))
-                return _open_ext[path]
+        def _get_ext(path: Path) -> pikepdf.Pdf:
+            if path not in _open_ext:
+                _open_ext[path] = stack.enter_context(pikepdf.open(path))
+            return _open_ext[path]
 
-            xobj_counter = 0
+        xobj_counter = 0
 
-            for slide_idx in sorted(by_slide.keys()):
-                new_idx = _new_page_index(slide_idx)
-                if new_idx is None:
-                    log.debug("apply_partial_pdf: slide %d is hidden, skipping", slide_idx)
+        for slide_idx in sorted(by_slide.keys()):
+            new_idx = _new_page_index(slide_idx)
+            if new_idx is None:
+                log.debug("apply_partial_pdf: slide %d is hidden, skipping", slide_idx)
+                continue
+            if new_idx < 1 or new_idx > len(dst.pages):
+                log.warning("apply_partial_pdf: slide %d → page %d out of range (%d pages)",
+                            slide_idx, new_idx, len(dst.pages))
+                continue
+
+            dst_page_obj = dst.pages[new_idx - 1].obj
+            canvas_mb = dst_page_obj.get("/MediaBox")
+            canvas_h = float(canvas_mb[3]) - float(canvas_mb[1]) if canvas_mb else 792.0
+
+            for info in sorted(by_slide[slide_idx], key=lambda i: i.z_index):
+                ext_path = _find_ext_pdf(info.blob_id)
+                if ext_path is None:
+                    log.warning("apply_partial_pdf: blob not found: %s.pdf in %s",
+                                info.blob_id, inputs_dir)
                     continue
-                if new_idx < 1 or new_idx > len(dst.pages):
-                    log.warning("apply_partial_pdf: slide %d → page %d out of range (%d pages)",
-                                slide_idx, new_idx, len(dst.pages))
+
+                ext_pdf = _get_ext(ext_path)
+                if len(ext_pdf.pages) == 0:
+                    log.warning("apply_partial_pdf: external PDF %s has no pages", ext_path)
                     continue
 
-                dst_page_obj = dst.pages[new_idx - 1].obj
-                canvas_mb = dst_page_obj.get("/MediaBox")
-                canvas_h = float(canvas_mb[3]) - float(canvas_mb[1]) if canvas_mb else 792.0
+                src_page_obj = ext_pdf.pages[0].obj
+                display_w, display_h, crop_box = _page_display_size(src_page_obj)
+                src_rotation = int(src_page_obj.get("/Rotate", 0))
 
-                for info in sorted(by_slide[slide_idx], key=lambda i: i.z_index):
-                    ext_path = _find_ext_pdf(info.blob_id)
-                    if ext_path is None:
-                        log.warning("apply_partial_pdf: blob not found: %s.pdf in %s",
-                                    info.blob_id, inputs_dir)
-                        continue
+                eff_w, eff_h, eff_x, eff_y = _set_fit_size(info, display_w, display_h)
 
-                    ext_pdf = _get_ext(ext_path)
-                    if len(ext_pdf.pages) == 0:
-                        log.warning("apply_partial_pdf: external PDF %s has no pages", ext_path)
-                        continue
+                matrix = _build_placement_matrix(
+                    eff_x, eff_y, eff_w, eff_h,
+                    info.rotation,
+                    display_w, display_h,
+                    canvas_h,
+                    crop_box,
+                )
 
-                    src_page_obj = ext_pdf.pages[0].obj
-                    display_w, display_h, crop_box = _page_display_size(src_page_obj)
-                    src_rotation = int(src_page_obj.get("/Rotate", 0))
+                if crop_box is not None and src_rotation % 360 != 0:
+                    rot_m = _source_rotation_matrix(src_rotation, display_w, display_h)
+                    matrix = _compose(matrix, rot_m)
 
-                    eff_w, eff_h, eff_x, eff_y = _set_fit_size(info, display_w, display_h)
+                xobj = _page_as_form_xobject(src_page_obj, dst)
+                xobj_name = f"/PXobj{xobj_counter}"
+                xobj_counter += 1
 
-                    matrix = _build_placement_matrix(
-                        eff_x, eff_y, eff_w, eff_h,
-                        info.rotation,
-                        display_w, display_h,
-                        canvas_h,
-                        crop_box,
-                    )
+                src_tagged = _is_tagged(ext_pdf)
+                figure_mcid = None
+                alt = ""
+                if not src_tagged:
+                    # Untagged overlay: one <Figure> with derived Alt text so the
+                    # tagged main PDF stays PDF/UA-clean (no-op if main is untagged).
+                    alt = build_alt_text(ext_pdf)
+                    figure_mcid = reserve_figure_mcid(dst, dst_page_obj, alt)
 
-                    if crop_box is not None and src_rotation % 360 != 0:
-                        rot_m = _source_rotation_matrix(src_rotation, display_w, display_h)
-                        matrix = _compose(matrix, rot_m)
+                _append_xobject_to_page(
+                    dst_page_obj, dst, xobj, xobj_name, matrix,
+                    figure_mcid=figure_mcid, alt=alt,
+                )
 
-                    xobj = _page_as_form_xobject(src_page_obj, dst)
-                    xobj_name = f"/PXobj{xobj_counter}"
-                    xobj_counter += 1
+                if src_tagged:
+                    try:
+                        migrate_tags_for_xobject(ext_pdf, 0, xobj, dst, dst_page_obj)
+                    except Exception as exc:
+                        log.warning("apply_partial_pdf: tag migration failed: %s", exc)
 
-                    _append_xobject_to_page(dst_page_obj, dst, xobj, xobj_name, matrix)
+                log.info(
+                    "apply_partial_pdf: slide=%d page=%d blob=%s xobj=%s "
+                    "matrix=[%.4f %.4f %.4f %.4f %.4f %.4f]",
+                    slide_idx, new_idx, info.blob_id, xobj_name, *matrix,
+                )
 
-                    log.info(
-                        "apply_partial_pdf: slide=%d page=%d blob=%s xobj=%s "
-                        "matrix=[%.4f %.4f %.4f %.4f %.4f %.4f]",
-                        slide_idx, new_idx, info.blob_id, xobj_name, *matrix,
-                    )
-
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            dst.save(output_path, min_version="1.7")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        dst.save(output_path, min_version="1.7")
 
     log.info("apply_partial_pdf: wrote %s", output_path)
 

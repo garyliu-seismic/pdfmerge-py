@@ -10,6 +10,7 @@ Both modes use Form XObject compositing via pikepdf content-stream manipulation.
 from __future__ import annotations
 
 import logging
+import shutil
 import re
 from pathlib import Path
 from typing import Optional
@@ -612,6 +613,13 @@ def merge_from_xml(
     it (a common pattern when one external PDF spans many slides).
     """
     import contextlib
+
+    if not merge_info.merge_items:
+        # C# TextOperations7.Merge only calls MergeNew when MergeItems.Count > 0; with
+        # none, the main PDF is the result as-is (hidden slides are not dropped).
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(main_pdf_path, output_path)
+        return
 
     # Build hidden-slide set
     hidden_slides: set[int] = {

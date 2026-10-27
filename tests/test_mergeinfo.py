@@ -709,3 +709,84 @@ def test_resolve_start_index_zero_uses_blob(tmp_path: Path) -> None:
                      start_index_in_merged_file=0, slides=[])
     path, page = resolve_external_page(item, SlideLocalId(pdf_page=2, slide_index=1, local_id=1), tmp_path)
     assert path.name == "blob.pdf" and page == 2
+
+
+_HIDDEN_PARTIAL_ONLY_XML = """\
+<?xml version="1.0" encoding="utf-16"?>
+<WorkspaceMergeInfo>
+  <partialPDF>
+    <info blob-id="part" content-control="FitBoth" horizontal-alignment="Left" vertical-alignment="Top">
+      <ParentType>Slide</ParentType><SlideIndex>4</SlideIndex>
+      <x>10</x><y>10</y><extCX>100</extCX><extCY>100</extCY>
+      <rotation>0</rotation><z-index>0</z-index>
+    </info>
+  </partialPDF>
+  <SlideInfo>
+    <info slideIndex="1" localId="10" hidden="false" />
+    <info slideIndex="2" localId="20" hidden="false" />
+    <info slideIndex="3" localId="30" hidden="true" />
+    <info slideIndex="4" localId="40" hidden="false" />
+    <info slideIndex="5" localId="50" hidden="false" />
+  </SlideInfo>
+</WorkspaceMergeInfo>
+"""
+
+
+def test_merge_xml_hidden_slides_without_merge_items_keep_all_main_pages(tmp_path: Path) -> None:
+    """C# TextOperations7 only runs MergeNew when MergeItems.Count > 0, so a partialPDF-only
+    merge-info with a hidden slide keeps every main page (5 main pages, slide 3 hidden -> 5
+    output pages); the partial overlay still maps slide 4 -> page 3 (4 - 1 hidden before)."""
+    from pdfmergepy.cli import main as cli_main
+    from pdfmergepy.partial import merge_xml_then_partial
+    _make_pdf(tmp_path / "main.pdf", 5, width=960, height=540)
+    _make_pdf(tmp_path / "part.pdf", 1, width=100, height=100)
+    xml = tmp_path / "m.xml"
+    _write_xml(xml, _HIDDEN_PARTIAL_ONLY_XML)
+    out = tmp_path / "out.pdf"
+    assert merge_xml_then_partial(xml, tmp_path / "main.pdf", tmp_path, out) == (0, 1)
+    with pikepdf.open(out) as pdf:
+        assert len(pdf.pages) == 5
+        have = [any(k.startswith("/PXobj") for k in
+                    (pg.obj.get("/Resources") or {}).get("/XObject", {}).keys())
+                for pg in pdf.pages]
+        assert have == [False, False, True, False, False]
+    out2 = tmp_path / "out2.pdf"
+    rc = cli_main(["merge-xml", str(xml), "--main", str(tmp_path / "main.pdf"),
+                   "--inputs-dir", str(tmp_path), "-o", str(out2)])
+    assert rc == 0
+    with pikepdf.open(out2) as pdf:
+        assert len(pdf.pages) == 5
+
+
+def test_merge_from_xml_hidden_slides_without_merge_items_copies_main(tmp_path: Path) -> None:
+    """Same rule for the PDFMerge step alone (no <PDFMerge>, SlideInfo with a hidden slide)."""
+    _make_pdf(tmp_path / "main.pdf", 5, width=960, height=540)
+    xml = tmp_path / "m.xml"
+    _write_xml(xml, _HIDDEN_PARTIAL_ONLY_XML.split("<partialPDF>")[0]
+               + "<SlideInfo>"
+               + _HIDDEN_PARTIAL_ONLY_XML.split("<SlideInfo>")[1])
+    out = tmp_path / "out.pdf"
+    merge_from_xml(parse_merge_info(xml), tmp_path / "main.pdf", tmp_path, out)
+    with pikepdf.open(out) as pdf:
+        assert len(pdf.pages) == 5
+
+
+def test_merge_xml_hidden_slide_with_merge_items_and_partial_still_drops_page(tmp_path: Path) -> None:
+    """Guard against regressing the PARTIAL path: with MergeItems present MergeNew runs and
+    drops the hidden slide; the partial overlay then maps through the same hidden set."""
+    from pdfmergepy.partial import merge_xml_then_partial
+    _make_pdf(tmp_path / "main.pdf", 3, width=960, height=540)     # slides 1,2,4 (3 hidden)
+    _make_pdf(tmp_path / "blob1.pdf", 1, width=960, height=540)
+    _make_pdf(tmp_path / "part.pdf", 1, width=100, height=100)
+    xml = tmp_path / "m.xml"
+    _write_xml(xml, _CHAIN_XML.format(blob="blob1")
+               .replace('<info slideIndex="2" localId="20" hidden="false" />',
+                        '<info slideIndex="2" localId="20" hidden="false" />\n'
+                        '    <info slideIndex="3" localId="30" hidden="true" />\n'
+                        '    <info slideIndex="4" localId="40" hidden="false" />')
+               .replace("<SlideIndex>2</SlideIndex>", "<SlideIndex>4</SlideIndex>"))
+    out = tmp_path / "out.pdf"
+    merge_xml_then_partial(xml, tmp_path / "main.pdf", tmp_path, out)
+    with pikepdf.open(out) as pdf:
+        assert len(pdf.pages) == 3
+        assert any(k.startswith("/PXobj") for k in pdf.pages[2].obj["/Resources"]["/XObject"].keys())

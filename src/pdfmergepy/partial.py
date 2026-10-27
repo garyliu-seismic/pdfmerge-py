@@ -736,7 +736,9 @@ def merge_xml_then_partial(
     if not infos:
         merge_from_xml(merge_info, main_pdf_path, inputs_dir, output_path)
         return n_merge, 0
-    if n_merge == 0 and not merge_info.slide_infos:
+    if n_merge == 0:
+        # C# TextOperations7: MergeNew only runs when MergeItems.Count > 0, so the
+        # main PDF (hidden slides included in SlideInfo) goes to MergeAll untouched.
         apply_partial_pdf_from_xml(xml_path, main_pdf_path, inputs_dir, output_path)
         return 0, len(infos)
 

@@ -161,14 +161,52 @@ def _validate_json(pdf_path: Path) -> dict:
 # Helpers to decide if a check result is an unexpected failure
 # ---------------------------------------------------------------------------
 
-def _unexpected_failures(validate_result: dict) -> list[dict]:
-    """Return checks that are Fail/Error and NOT in the known-skip set."""
+def _count_altless_figures(pdf_path: Path) -> int:
+    """Number of <Figure> struct elements without a non-empty /Alt (iterative walk)."""
+    with pikepdf.open(pdf_path) as pdf:
+        root = pdf.Root.get("/StructTreeRoot")
+        if root is None:
+            return 0
+        n, seen, stack = 0, set(), [root]
+        while stack:
+            node = stack.pop()
+            if not hasattr(node, "get"):
+                continue
+            og = getattr(node, "objgen", (0, 0))
+            if og != (0, 0):
+                if og in seen:
+                    continue
+                seen.add(og)
+            if node.get("/S") == "/Figure":
+                alt = node.get("/Alt")
+                if alt is None or not str(alt).strip():
+                    n += 1
+            k = node.get("/K")
+            if isinstance(k, pikepdf.Array):
+                stack.extend(k)
+            elif k is not None:
+                stack.append(k)
+        return n
+
+
+def _unexpected_failures(validate_result: dict, *, out_path: "Path | None" = None,
+                         src_paths: "tuple[Path, ...]" = ()) -> list[dict]:
+    """Return checks that are Fail/Error and NOT in the known-skip set.
+
+    Matterhorn 13-004 (Figure without /Alt) is only unexpected when the merged output has
+    *more* alt-less Figures than the source PDF(s) that contributed the tags: like the C#
+    merger, pdfmergepy keeps source tags as-is (it does not invent Alt text), so a Figure
+    the source already shipped without /Alt is a source-quality defect, not a merge defect.
+    """
     bad = []
     for chk in validate_result.get("checks", []):
         if chk["severity"] not in ("Fail", "Error"):
             continue
         if chk["id"] in KNOWN_SKIP:
             continue
+        if chk["id"] == "13-004" and out_path is not None:
+            if _count_altless_figures(out_path) <= sum(_count_altless_figures(p) for p in src_paths):
+                continue
         bad.append(chk)
     return bad
 
@@ -259,7 +297,7 @@ def test_blob_merge_and_validate(
     except Exception as exc:
         pytest.fail(f"[{blob_name}/{mode}] pdftagvalicate crashed: {exc}")
 
-    bad = _unexpected_failures(vresult)
+    bad = _unexpected_failures(vresult, out_path=out_path, src_paths=(blob_path,))
     if bad:
         details = "\n".join(
             f"  [{c['id']}] {c['name']}: {c['severity']}\n"

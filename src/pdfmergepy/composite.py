@@ -10,6 +10,7 @@ Both modes use Form XObject compositing via pikepdf content-stream manipulation.
 from __future__ import annotations
 
 import logging
+import shutil
 import re
 from pathlib import Path
 from typing import Optional
@@ -18,12 +19,14 @@ import pikepdf
 
 from pdfmergepy.acroform import add_page_with_forms
 from pdfmergepy.tagtree import (
+    _find_document_elem,
     fix_link_annots,
     merge_page_tags,
     migrate_tags_for_xobject,
     set_pdfua_metadata,
 )
 from pdfmergepy._repairs import apply_post_merge_repairs
+from pdfmergepy.outlines import OutlineMerger
 from pdfmergepy.mergeinfo import (
     MergeItem,
     SlideLocalId,
@@ -360,6 +363,31 @@ def _build_rotation_aware_matrix(
     return [a, b, c, d, e, f]
 
 
+def _copy_external_tags(
+    ext_src: pikepdf.Pdf,
+    ext_page_index: int,
+    ext_path: "Path | str",
+    dst: pikepdf.Pdf,
+    new_page_obj,
+) -> None:
+    """Carry the external page's own tags into *dst*.
+
+    C# ``merger.Merge(fromDoc, extPage)`` goes through iText ``CopyPagesTo``,
+    which copies the page together with its struct elements; the main page's
+    tags are migrated afterwards on top (``MigrateTagsForXObject``).  Must run
+    right after the external page was appended and before the main-page
+    migration, so the external elements come first under ``<Document>``.
+    """
+    migrated = merge_page_tags(
+        ext_src, dst, new_page_obj,
+        src_page_index=ext_page_index, src_path=ext_path,
+    )
+    # No ParentTree slot was written (untagged external page / no marked
+    # content): the /StructParents copied with the page would dangle.
+    if not migrated and "/StructParents" in new_page_obj:
+        del new_page_obj["/StructParents"]
+
+
 def _merge_fit_pdf_size(
     main_page_obj,
     ext_page_obj,
@@ -384,6 +412,7 @@ def _merge_fit_pdf_size(
     # Step 1: copy external page into dst, preserving AcroForm fields.
     add_page_with_forms(dst, ext_src, ext_page_index, src_path=ext_path)
     new_page_obj = dst.pages[-1].obj
+    _copy_external_tags(ext_src, ext_page_index, ext_path, dst, new_page_obj)
 
     # Step 2: explicitly fix the MediaBox on the new page to the external page's
     # native dimensions.  pikepdf.Page(ext_page_obj) copies the object but the
@@ -419,8 +448,13 @@ def _merge_fit_pdf_size(
     # Step 8 (Phase 2): migrate main-page tag tree into dst via XObject MCR dicts.
     if main_src is not None:
         try:
+            # C# passes FindDocumentStructElem as explicitAttachPoint, so the
+            # main tags sit beside the external page's elements rather than
+            # inside one of its containers.
             migrate_tags_for_xobject(
                 main_src, main_page_index, xobj, dst, new_page_obj,
+                explicit_attach=_find_document_elem(dst.Root["/StructTreeRoot"])
+                if "/StructTreeRoot" in dst.Root else None,
             )
         except Exception as _exc:
             import logging as _logging
@@ -515,6 +549,7 @@ def _merge_fit_main_size(
     # Step 1: copy external page into dst, preserving AcroForm fields.
     add_page_with_forms(dst, ext_src, ext_page_index, src_path=ext_path)
     new_page_obj = dst.pages[-1].obj
+    _copy_external_tags(ext_src, ext_page_index, ext_path, dst, new_page_obj)
 
     # Step 2: set MediaBox = main page MediaBox
     rotation = int(ext_page_obj.get("/Rotate", 0))
@@ -567,7 +602,7 @@ def merge_from_xml(
 ) -> None:
     """Merge PDFs according to a WorkspaceMergeInfo, porting CTS2.0 MergeNew.
 
-    Iterates main PDF pages (slide_index = 1..N):
+    Iterates slides (SlideInfo slide_index = 1..N):
     - Hidden slides (SlideInfo.hidden=true) are skipped.
     - Slides with a MergeItem → Mode A or B compositing.
     - Slides without a MergeItem → copy main page as-is.
@@ -578,6 +613,13 @@ def merge_from_xml(
     it (a common pattern when one external PDF spans many slides).
     """
     import contextlib
+
+    if not merge_info.merge_items:
+        # C# TextOperations7.Merge only calls MergeNew when MergeItems.Count > 0; with
+        # none, the main PDF is the result as-is (hidden slides are not dropped).
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(main_pdf_path, output_path)
+        return
 
     # Build hidden-slide set
     hidden_slides: set[int] = {
@@ -598,6 +640,9 @@ def merge_from_xml(
         with pikepdf.Pdf.new() as dst, contextlib.ExitStack() as ext_stack:
             # Propagate PDF/UA metadata from main PDF (SetPDFUATag equivalent)
             set_pdfua_metadata(main_pdf, dst)
+            # C# MergeNew: InitializeOutlines(); outline items follow the pages
+            # copied natively (plain main pages, external pages of replaced slides).
+            outlines = OutlineMerger(dst)
             # Cache of path → open pikepdf.Pdf, opened lazily on first use.
             # ExitStack closes all of them when the `with` block exits.
             _open_ext: dict[Path, pikepdf.Pdf] = {}
@@ -669,17 +714,27 @@ def merge_from_xml(
                             main_src=main_pdf,
                             main_page_index=main_page_index,
                         )
+                    # The main page is only wrapped as a Form XObject (never
+                    # CopyPagesTo'd), so its outline items are dropped; the
+                    # external page's are kept.
+                    outlines.copy_page(ext_pdf, ext_page_index, dst.pages[-1].obj)
                 else:
                     # Plain copy: AcroForm fields + tag tree from main PDF.
                     add_page_with_forms(
                         dst, main_pdf, main_page_index, src_path=main_pdf_path
                     )
                     # Tag-tree merge: main_pdf still open → copy_foreign safe
-                    merge_page_tags(
-                        main_pdf, dst, dst.pages[-1].obj,
+                    plain_page = dst.pages[-1].obj
+                    migrated = merge_page_tags(
+                        main_pdf, dst, plain_page,
                         src_page_index=main_page_index,
                         src_path=main_pdf_path,
                     )
+                    # No ParentTree entry was written (untagged page / no marked
+                    # content): the /StructParents copied with the page would dangle.
+                    if not migrated and "/StructParents" in plain_page:
+                        del plain_page["/StructParents"]
+                    outlines.copy_page(main_pdf, main_page_index, dst.pages[-1].obj)
 
             dst.docinfo["/Producer"] = "pdfmergepy (pikepdf/QPDF)"
 

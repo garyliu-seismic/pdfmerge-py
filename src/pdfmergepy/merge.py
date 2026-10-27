@@ -19,6 +19,7 @@ from pathlib import Path
 import pikepdf
 
 from pdfmergepy.acroform import add_pages_range_with_forms
+from pdfmergepy.outlines import OutlineMerger
 from pdfmergepy.pdfutil import PageSpec
 from pdfmergepy.tagtree import fix_link_annots, merge_page_tags, set_pdfua_metadata
 from pdfmergepy._repairs import apply_post_merge_repairs
@@ -40,6 +41,7 @@ def merge_files(specs: list[PageSpec], output: Path) -> None:
     with pikepdf.Pdf.new() as dst:
         _pdfua_set = False
         _first_src: "pikepdf.Pdf | None" = None  # kept open for XMP repair below
+        outlines = OutlineMerger(dst)
         for spec in specs:
             with pikepdf.open(spec.path) as src:
                 # Propagate PDF/UA metadata from the first tagged source
@@ -67,6 +69,8 @@ def merge_files(specs: list[PageSpec], output: Path) -> None:
                     # slot) would dangle, so drop it.
                     if not migrated and "/StructParents" in dst_page_obj:
                         del dst_page_obj["/StructParents"]
+                    # CopyPagesTo clones the outline items that target the page
+                    outlines.copy_page(src, src_idx, dst_page_obj)
 
         # Match itext7's PdfMerger.cs, which explicitly declares 1.7
         # (WriterProperties().SetPdfVersion(PdfVersion.PDF_1_7)) rather than

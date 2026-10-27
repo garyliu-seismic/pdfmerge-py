@@ -31,6 +31,7 @@ editable install : pip install -e .
 | `tagtree.py` | ~1000 | StructTree plain-copy + XObject MCR 迁移 | `PdfMergeTagHelper` |
 | `cli.py` | ~330 | CLI（`merge` / `info` / `merge-xml` / `partial-merge` / `split` / `select` / `delete` / `append` / `page-count` / `list-fonts` / `embed-fonts` / `remove-fonts`） | — |
 | `pageranges.py` | ~110 | **页码表达式 `1,3,6-8,10-`**（精确移植） | `PdfUtility.EnumAllPageSections` / `PageSection.IsInclude` |
+| `outlines.py` | ~200 | 每个原生拷贝的页面克隆指向该页的书签（含祖先容器）；merge-xml 总是建 /Outlines 根 | `CopyPagesTo` outline 克隆 / `InitializeOutlines` |
 | `prune.py` | ~480 | **删页 + 修剪 StructTree/ParentTree/AcroForm/Outlines/Dests/PageLabels** | `CopyPagesTo` + `PdfPageFormCopier` 的效果 |
 | `pageops.py` | ~170 | **select / delete / split / append / page-count** | `PdfSelector` / `PdfSplitter` / `PdfSplitConverter` / `PdfManager.GetPageCount` |
 | `fonts.py` | ~350 | 字体发现（继承 Resources、Form XObject、Pattern、SMask、Annot AP、Type3、AcroForm DR）、`list_fonts`、`remove_fonts` | `InternalUtility.GetAllFontRelatedObjects` / `RemoveFonts` / `GetUsedFonts` |

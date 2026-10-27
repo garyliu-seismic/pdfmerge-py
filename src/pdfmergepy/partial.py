@@ -75,9 +75,7 @@ from typing import Optional
 import pikepdf
 
 from .tagtree import (
-    _is_tagged,
     build_alt_text,
-    migrate_tags_for_xobject,
     reserve_figure_mcid,
 )
 
@@ -654,25 +652,18 @@ def apply_partial_pdf(
                 xobj_name = f"/PXobj{xobj_counter}"
                 xobj_counter += 1
 
-                src_tagged = _is_tagged(ext_pdf)
-                figure_mcid = None
-                alt = ""
-                if not src_tagged:
-                    # Untagged overlay: one <Figure> with derived Alt text so the
-                    # tagged main PDF stays PDF/UA-clean (no-op if main is untagged).
-                    alt = build_alt_text(ext_pdf)
-                    figure_mcid = reserve_figure_mcid(dst, dst_page_obj, alt)
+                # C# PartialPdfMerger.ApppendPartialPdfOnSlide: the call to
+                # MigrateTagsForXObject is commented out in production, so *every*
+                # overlay (tagged or not) is drawn inside a single <Figure> whose Alt
+                # is derived from the source (first /Alt or /ActualText in its tag tree,
+                # else the generic default).  No-op if the main PDF is untagged.
+                alt = build_alt_text(ext_pdf)
+                figure_mcid = reserve_figure_mcid(dst, dst_page_obj, alt)
 
                 _append_xobject_to_page(
                     dst_page_obj, dst, xobj, xobj_name, matrix,
                     figure_mcid=figure_mcid, alt=alt,
                 )
-
-                if src_tagged:
-                    try:
-                        migrate_tags_for_xobject(ext_pdf, 0, xobj, dst, dst_page_obj)
-                    except Exception as exc:
-                        log.warning("apply_partial_pdf: tag migration failed: %s", exc)
 
                 log.info(
                     "apply_partial_pdf: slide=%d page=%d blob=%s xobj=%s "
@@ -736,7 +727,9 @@ def merge_xml_then_partial(
     if not infos:
         merge_from_xml(merge_info, main_pdf_path, inputs_dir, output_path)
         return n_merge, 0
-    if n_merge == 0 and not merge_info.slide_infos:
+    if n_merge == 0:
+        # C# TextOperations7: MergeNew only runs when MergeItems.Count > 0, so the
+        # main PDF (hidden slides included in SlideInfo) goes to MergeAll untouched.
         apply_partial_pdf_from_xml(xml_path, main_pdf_path, inputs_dir, output_path)
         return 0, len(infos)
 

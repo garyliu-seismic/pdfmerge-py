@@ -554,6 +554,62 @@ def test_merge_xml_hidden_slide_maps_to_shifted_main_page(tmp_path: Path) -> Non
         assert len(out.pages[1].obj["/Resources"]["/XObject"].keys()) >= 1
 
 
+def _make_sized_pdf(path: Path, widths: list[float], height: float = 300) -> None:
+    """One page per entry; the page width identifies the page."""
+    pdf = pikepdf.Pdf.new()
+    for w in widths:
+        pdf.add_blank_page(page_size=(w, height))
+    pdf.save(path)
+
+
+@pytest.mark.parametrize("hidden", [[4], [1], [5], [2, 4], [1, 2, 3, 4]])
+def test_merge_xml_hidden_slides_map_by_slide_not_main_page(tmp_path: Path, hidden: list[int]) -> None:
+    """LT-351 caseB_hidden shape: 5 slides, the main PDF holds only the visible ones.
+
+    C# PdfMerger.MergeNew loops over SlideInfo (not main pages): hidden slides
+    are skipped, the others take main page ``slide - hiddenBefore`` and keep
+    their slide number for the MergeItem lookup. The last slide is replaced by
+    external page 5 (pdfPage=5); no visible slide may be dropped.
+    """
+    visible = [s for s in range(1, 6) if s not in hidden]
+    main_widths = [float(100 * s) for s in visible]            # page width == 100*slide
+    _make_sized_pdf(tmp_path / "main.pdf", main_widths)
+    _make_sized_pdf(tmp_path / "blob-test.pdf", [1000.0 + 100 * i for i in range(1, 6)])
+    last = visible[-1] if visible else None
+    infos = chr(10).join(
+        f'    <info slideIndex="{s}" localId="{s}0" hidden="{"true" if s in hidden else "false"}" />'
+        for s in range(1, 6)
+    )
+    slide_ids = f'<slideLocalId pdfPage="{last}" slideIndex="{last}">{last}0</slideLocalId>' if last else ""
+    _write_xml(tmp_path / "m.xml", f"""<?xml version="1.0" encoding="utf-16"?>
+<WorkspaceMergeInfo>
+  <PDFMerge>
+    <MergeItem FitPDFSize="true" SlideFitPattern="AlignTopLeft" pageCount="5"
+               id="item" BlobId="blob-test">
+      <MergedPdfFileInfo MergedPdfFileId="" StartIndexInMergedFile="-1" />
+      {slide_ids}
+    </MergeItem>
+  </PDFMerge>
+  <SlideInfo>
+{infos}
+  </SlideInfo>
+</WorkspaceMergeInfo>
+""")
+    out_path = tmp_path / "out.pdf"
+    merge_from_xml(parse_merge_info(tmp_path / "m.xml"), tmp_path / "main.pdf", tmp_path, out_path)
+    with pikepdf.open(out_path) as out:
+        assert len(out.pages) == len(visible)
+        widths = [float(p.MediaBox[2]) - float(p.MediaBox[0]) for p in out.pages]
+        expected = [float(100 * s) for s in visible]
+        if last:
+            expected[-1] = 1000.0 + 100 * last          # replaced: external page size
+        assert widths == expected
+        if last:
+            xo = out.pages[-1].obj["/Resources"]["/XObject"]
+            # the overlay is the *last visible* main page (not a hidden slide's)
+            assert float(xo["/Xobj0"].BBox[2]) == 100.0 * last
+
+
 def test_merge_xml_mode_a_resets_external_cropbox(tmp_path: Path) -> None:
     """Mode A: a stale external /CropBox must not clip the overlay."""
     main_pdf_path = tmp_path / "main.pdf"

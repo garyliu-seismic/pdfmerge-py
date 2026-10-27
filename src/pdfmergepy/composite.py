@@ -24,6 +24,7 @@ from pdfmergepy.tagtree import (
     set_pdfua_metadata,
 )
 from pdfmergepy._repairs import apply_post_merge_repairs
+from pdfmergepy.outlines import OutlineMerger
 from pdfmergepy.mergeinfo import (
     MergeItem,
     SlideLocalId,
@@ -567,7 +568,7 @@ def merge_from_xml(
 ) -> None:
     """Merge PDFs according to a WorkspaceMergeInfo, porting CTS2.0 MergeNew.
 
-    Iterates main PDF pages (slide_index = 1..N):
+    Iterates slides (SlideInfo slide_index = 1..N):
     - Hidden slides (SlideInfo.hidden=true) are skipped.
     - Slides with a MergeItem → Mode A or B compositing.
     - Slides without a MergeItem → copy main page as-is.
@@ -598,6 +599,9 @@ def merge_from_xml(
         with pikepdf.Pdf.new() as dst, contextlib.ExitStack() as ext_stack:
             # Propagate PDF/UA metadata from main PDF (SetPDFUATag equivalent)
             set_pdfua_metadata(main_pdf, dst)
+            # C# MergeNew: InitializeOutlines(); outline items follow the pages
+            # copied natively (plain main pages, external pages of replaced slides).
+            outlines = OutlineMerger(dst)
             # Cache of path → open pikepdf.Pdf, opened lazily on first use.
             # ExitStack closes all of them when the `with` block exits.
             _open_ext: dict[Path, pikepdf.Pdf] = {}
@@ -669,6 +673,10 @@ def merge_from_xml(
                             main_src=main_pdf,
                             main_page_index=main_page_index,
                         )
+                    # The main page is only wrapped as a Form XObject (never
+                    # CopyPagesTo'd), so its outline items are dropped; the
+                    # external page's are kept.
+                    outlines.copy_page(ext_pdf, ext_page_index, dst.pages[-1].obj)
                 else:
                     # Plain copy: AcroForm fields + tag tree from main PDF.
                     add_page_with_forms(
@@ -680,6 +688,7 @@ def merge_from_xml(
                         src_page_index=main_page_index,
                         src_path=main_pdf_path,
                     )
+                    outlines.copy_page(main_pdf, main_page_index, dst.pages[-1].obj)
 
             dst.docinfo["/Producer"] = "pdfmergepy (pikepdf/QPDF)"
 

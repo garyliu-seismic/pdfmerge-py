@@ -438,3 +438,21 @@ def test_untagged_plain_main_pages_have_no_dangling_structparents(tmp_path: Path
         for page in pdf.pages:
             if "/StructParents" in page.obj:
                 assert int(page.obj.StructParents) in keys
+
+
+def test_plain_copy_container_elements_carry_no_pg(tmp_path: Path) -> None:
+    """iText CopyPagesTo leaves /Pg off containers that own no content and had none
+    (LivedocMerge case 3: prod Sect/Article/Story have no /Pg); elements owning
+    marked content keep it."""
+    def build(pdf, page, doc):
+        sect = pdf.make_indirect(Dictionary(Type=Name.StructElem, S=Name("/Sect"), P=doc))   # no /Pg
+        leaf = _el(pdf, "/P", sect, page, 0)
+        sect.K = leaf
+        doc.K.append(sect)
+        return {0: leaf}
+    with _merged(tmp_path, _tagged_page_pdf(tmp_path / "s.pdf", build)) as pdf:
+        assert _problems(pdf) == {}
+        sect = next(e for e in _walk(_document(pdf)) if e.S == "/Sect")
+        leaf = next(e for e in _walk(_document(pdf)) if e.S == "/P")
+        assert "/Pg" not in sect
+        assert leaf.Pg.objgen == pdf.pages[0].obj.objgen

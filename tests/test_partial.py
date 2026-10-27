@@ -563,3 +563,34 @@ def test_partial_untagged_main_stays_untagged(tmp_path: Path) -> None:
     apply_partial_pdf([_ov_info()], main, tmp_path, out)
     with pikepdf.open(out) as pdf:
         assert "/StructTreeRoot" not in pdf.Root
+
+
+def test_partial_tagged_overlay_is_wrapped_in_single_figure_like_prod(tmp_path: Path) -> None:
+    """Prod C# has MigrateTagsForXObject commented out in PartialPdfMerger: a *tagged*
+    overlay is not migrated either, it is drawn in one <Figure> whose Alt comes from the
+    source's tag tree (LivedocMerge case 3: page 2 holds just that Figure)."""
+    from tests.pdfbuilder import build_pdf
+    from tests.tagcheck import tag_problems
+    main = build_pdf(tmp_path / "main.pdf", n=2)
+    ext = build_pdf(tmp_path / "ext.pdf", n=1, forms=False, text_prefix="Ext")
+    with pikepdf.open(ext, allow_overwriting_input=True) as e:
+        e.Root.StructTreeRoot.K.K[0].K[0].Alt = pikepdf.String("source alt")   # Document>Sect>P
+        e.save(ext)
+    out = tmp_path / "out.pdf"
+
+    apply_partial_pdf([_ov_info(1)], main, tmp_path, out)
+
+    with pikepdf.open(out) as pdf:
+        assert sum(tag_problems(pdf).values()) == 0
+        roles, stack = [], [pdf.Root.StructTreeRoot]
+        while stack:
+            n = stack.pop()
+            if n.get("/S") is not None:
+                roles.append((str(n.S), n.get("/Alt")))
+            k = n.get("/K")
+            stack.extend(x for x in (list(k) if isinstance(k, pikepdf.Array) else [k] if k is not None else [])
+                         if hasattr(x, "get") and x.get("/Type") not in ("/MCR", "/OBJR"))
+        # main's own 2 pages (Document, 2 x [Sect, P, Span, Link]) + exactly one overlay Figure
+        assert [r for r, _ in roles].count("/Figure") == 1
+        assert [a for r, a in roles if r == "/Figure"] == ["source alt"]
+        assert [r for r, _ in roles].count("/Sect") == 2          # nothing migrated from the overlay

@@ -642,11 +642,18 @@ def _migrate_mcrs_for_page(
             log.warning("tagtree: cyclic struct-tree /K at %s (src=%s); subtree skipped",
                         key, src_path)
             return None
-        dst_elem = _new_dst_elem(src_elem, dst, dst_page_obj, dst_parent)
+        kid_list = _as_kid_list(src_elem.get("/K"))
+        # iText leaves /Pg off pure containers (Sect, Article, ... without a /Pg of their
+        # own and without content of their own); only elements that own content keep one.
+        owns_content = own_pg is not None or any(
+            isinstance(k, int) or (hasattr(k, "get") and k.get("/Type") in (
+                pikepdf.Name("/MCR"), pikepdf.Name("/OBJR")))
+            for k in kid_list)
+        dst_elem = _new_dst_elem(src_elem, dst, dst_page_obj if owns_content else None, dst_parent)
         _append_kid(dst_parent, dst_elem)
         created += 1
         on_path.add(key)
-        return (key, dst_elem, iter(_as_kid_list(src_elem.get("/K"))), cur_pg, in_marked or parent_ok)
+        return (key, dst_elem, iter(kid_list), cur_pg, in_marked or parent_ok)
 
     def mirror(src_top, dst_parent) -> None:
         """Iterative top-down mirror (explicit stack): struct trees nested thousands of
@@ -1261,21 +1268,22 @@ def _find_page_owner_by_pg(
 def _new_dst_elem(
     src_elem: pikepdf.Object,
     dst: pikepdf.Pdf,
-    dst_page_obj: pikepdf.Object,
+    dst_page_obj: "pikepdf.Object | None",
     dst_parent: pikepdf.Object,
 ) -> pikepdf.Object:
     """Create a fresh dst StructElem mirroring *src_elem*'s role and attributes.
 
-    ``/K`` starts empty; ``/Pg`` is *dst_page_obj*.  Copies the non-structural
+    ``/K`` starts empty; ``/Pg`` is *dst_page_obj* (omitted when ``None``).  Copies the non-structural
     attributes (e.g. /Alt, /ActualText, /A, /Lang).
     """
     role = src_elem.get("/S")
     new_elem = dst.make_indirect(pikepdf.Dictionary(
         Type=pikepdf.Name("/StructElem"),
         S=role,
-        Pg=dst_page_obj,
         P=dst_parent,
     ))
+    if dst_page_obj is not None:
+        new_elem["/Pg"] = dst_page_obj
     new_elem["/K"] = pikepdf.Array()
 
     # Copy non-structural attributes (e.g. /Alt, /ActualText, /A, /Lang).

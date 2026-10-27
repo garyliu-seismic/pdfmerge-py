@@ -551,6 +551,10 @@ def _write_parent_tree_slot(
 # Plain-copy MCR wiring (companion to migrate_tags_for_xobject for plain pages)
 # ---------------------------------------------------------------------------
 
+_CELL_ROLES = frozenset(["/TD", "/TH"])
+_ROW_ROLES = frozenset(["/TR", "/TBody", "/THead", "/TFoot"])
+
+
 def _migrate_mcrs_for_page(
     src_root: pikepdf.Object,
     src_page_obj: "pikepdf.Object | None",
@@ -562,77 +566,218 @@ def _migrate_mcrs_for_page(
     *,
     src_path: "Path | str" = "",
 ) -> bool:
-    """Wire MCR dicts for a plain-copied page into the destination struct tree.
+    """Copy the struct elements of one natively copied page into *dst*.
 
-    Mirrors the MCR-migration logic of :func:`migrate_tags_for_xobject` but
-    for the **plain-copy path** where content lives directly on the page
-    (no Form XObject):
+    Counterpart of what iText's ``CopyPagesTo`` does for the plain-copy path
+    (content lives directly on the page, no Form XObject):
 
-    1. Read ``src /ParentTree[src_slot]`` to get the dense array of
-       StructElems indexed by MCID for this page.
-    2. For each StructElem, mirror its ancestor chain into *dst* via
-       :func:`_ensure_ancestor_chain` (creating fresh dst elements with
-       ``/Pg = dst_page_obj``).
-    3. Append a plain MCR dict ``{/Type /MCR, /Pg dst_page, /MCID n}`` to
-       each mirrored dst StructElem's ``/K`` array.
-    4. Write the dense dst ParentTree array at *dst_slot*.
+    1. Find the elements that own content on the page: the owners of its
+       marked-content sequences (``/ParentTree`` slot of the page) and of its
+       annotations (``/StructParent`` of each annotation).
+    2. Walk the source struct tree top-down in ``/K`` order and mirror every
+       element that owns content on the page or has such a descendant (the
+       ancestors of the owners), plus -- like iText -- *empty table cells*
+       (a ``TD``/``TH`` without kids, and ``TR``/``TBody``/... made only of such
+       cells) below a mirrored element; other empty elements are dropped.
+    3. Append ``{/Type /MCR, /Pg dst_page, /MCID n}`` for each marked-content
+       reference and ``{/Type /OBJR, /Pg dst_page, /Obj dst_annot}`` for each
+       annotation reference (the annotation gets a fresh ``/StructParent``).
+    4. Write the dense MCID -> element array at *dst_slot* of the dst
+       ``/ParentTree``, then one entry per annotation.
 
-    Returns ``True`` if at least one MCR was wired.
+    Returns ``True`` if at least one element was mirrored.
     """
     if src_page_obj is None:
         return False
 
-    # Collect MCID -> src StructElem from src ParentTree
-    mcid_to_src_elem: dict[int, pikepdf.Object] = {}
-    _collect_page_mcrs(src_root, src_page_obj, mcid_to_src_elem)
-    if not mcid_to_src_elem:
+    # ---- 1. content owners and their ancestors ------------------------------------
+    mcid_owner: dict[int, pikepdf.Object] = {}
+    _collect_page_mcrs(src_root, src_page_obj, mcid_owner)
+    annot_owner = _collect_page_annot_owners(src_root, src_page_obj)
+    owners = list(mcid_owner.values()) + list(annot_owner.values())
+    if not owners:
         return False
 
-    max_mcid = max(mcid_to_src_elem.keys())
+    marked: set = set()                  # elements owning content on the page, or above one
+    for elem in owners:
+        cur, guard = elem, 0
+        while hasattr(cur, "get") and guard < 10_000:
+            key = _elem_key(cur)
+            if key in marked:
+                break
+            marked.add(key)
+            parent = cur.get("/P")
+            if parent is None or not hasattr(parent, "get") \
+                    or parent.get("/S") == pikepdf.Name("/Document") \
+                    or parent.get("/Type") == pikepdf.Name("/StructTreeRoot"):
+                break
+            cur, guard = parent, guard + 1
 
-    # Mirror ancestor chains
-    parent_map: dict[int, pikepdf.Object] = {}  # src objgen -> dst StructElem
+    # ---- 2./3. top-down mirror ------------------------------------------------------
+    page_og = src_page_obj.objgen
+    src_annots = list(src_page_obj.get("/Annots") or [])
+    dst_annots = list(dst_page_obj.get("/Annots") or [])
+    annot_index = {a.objgen: i for i, a in enumerate(src_annots)
+                   if getattr(a, "objgen", (0, 0)) != (0, 0)}
+
     mcid_to_dst_elem: dict[int, pikepdf.Object] = {}
-    for mcid, src_elem in mcid_to_src_elem.items():
-        try:
-            dst_elem = _ensure_ancestor_chain(
-                src_elem, src_root, dst_root, dst, dst_page_obj,
-                dest_attach, parent_map,
-            )
-        except Exception as exc:
-            log.warning("_migrate_mcrs_for_page: ancestor chain failed mcid=%d: %s", mcid, exc)
-            continue
-        if dst_elem is not None:
-            mcid_to_dst_elem[mcid] = dst_elem
+    annot_entries: list[tuple[pikepdf.Object, pikepdf.Object]] = []   # (dst_annot, dst_elem)
+    created = 0
 
-    if not mcid_to_dst_elem:
+    def mirror(src_elem, dst_parent, cur_pg, parent_ok: bool) -> None:
+        nonlocal created
+        own_pg = src_elem.get("/Pg")
+        if own_pg is not None and hasattr(own_pg, "objgen"):
+            cur_pg = own_pg.objgen
+        in_marked = _elem_key(src_elem) in marked
+        if not in_marked:
+            if not (parent_ok and _is_empty_table_part(src_elem, cur_pg, page_og)):
+                return
+        if src_elem.get("/S") is None:
+            return
+        dst_elem = _new_dst_elem(src_elem, dst, dst_page_obj, dst_parent)
+        _append_kid(dst_parent, dst_elem)
+        created += 1
+        child_ok = in_marked or parent_ok
+        for kid in _as_kid_list(src_elem.get("/K")):
+            if isinstance(kid, int):
+                if cur_pg in (page_og, None):
+                    _add_mcr(dst, dst_elem, dst_page_obj, int(kid), mcid_to_dst_elem)
+                continue
+            if not hasattr(kid, "get"):
+                continue
+            ktype = kid.get("/Type")
+            if ktype == pikepdf.Name("/MCR"):
+                kpg = kid.get("/Pg")
+                kpg = kpg.objgen if kpg is not None and hasattr(kpg, "objgen") else cur_pg
+                if "/Stm" not in kid and kpg in (page_og, None) and "/MCID" in kid:
+                    _add_mcr(dst, dst_elem, dst_page_obj, int(kid["/MCID"]), mcid_to_dst_elem)
+            elif ktype == pikepdf.Name("/OBJR"):
+                kpg = kid.get("/Pg")
+                kpg = kpg.objgen if kpg is not None and hasattr(kpg, "objgen") else cur_pg
+                obj = kid.get("/Obj")
+                i = annot_index.get(getattr(obj, "objgen", None))
+                if kpg in (page_og, None) and i is not None and i < len(dst_annots) \
+                        and dst_annots[i].get("/Subtype") == src_annots[i].get("/Subtype"):
+                    objr = dst.make_indirect(pikepdf.Dictionary(
+                        Type=pikepdf.Name("/OBJR"), Pg=dst_page_obj, Obj=dst_annots[i]))
+                    _append_kid(dst_elem, objr)
+                    annot_entries.append((dst_annots[i], dst_elem))
+            else:
+                mirror(kid, dst_elem, cur_pg, child_ok)
+
+    # <Document> kids of the root are containers; their kids are the page-level elements
+    tops: list = []
+    for k in _as_kid_list(src_root.get("/K")):
+        if hasattr(k, "get") and k.get("/S") == pikepdf.Name("/Document"):
+            tops.extend(_as_kid_list(k.get("/K")))
+        else:
+            tops.append(k)
+    for kid in tops:
+        if hasattr(kid, "get") and kid.get("/Type") not in (
+                pikepdf.Name("/MCR"), pikepdf.Name("/OBJR")):
+            mirror(kid, dest_attach, None, False)
+
+    if not created:
         return False
 
-    # Build dense ParentTree array
-    _PDF_NULL = pikepdf.Object.parse(b"null")
-    arr = pikepdf.Array()
-    for i in range(max_mcid + 1):
-        elem = mcid_to_dst_elem.get(i)
-        arr.append(elem if elem is not None else _PDF_NULL)
+    # ---- 4. ParentTree ----------------------------------------------------------------
+    if mcid_to_dst_elem:
+        _PDF_NULL = pikepdf.Object.parse(b"null")
+        arr = pikepdf.Array()
+        for i in range(max(mcid_to_dst_elem) + 1):
+            elem = mcid_to_dst_elem.get(i)
+            arr.append(elem if elem is not None else _PDF_NULL)
+        _write_xobject_parent_table(dst_root, dst_slot, arr)
+    elif "/StructParents" in dst_page_obj:
+        # nothing to point at: the allocated slot stays unused
+        del dst_page_obj["/StructParents"]
 
-    # Write to /ParentTree at the pre-allocated slot
-    _write_xobject_parent_table(dst_root, dst_slot, arr)
-
-    # Append plain MCR dicts to dst StructElems.
-    # Make each MCR dict an indirect object so pikepdf's walk_struct_tree
-    # can use its stable objgen (instead of id()) for cycle detection.
-    for mcid, dst_elem in mcid_to_dst_elem.items():
-        mcr = dst.make_indirect(pikepdf.Dictionary())
-        mcr["/Type"] = pikepdf.Name("/MCR")
-        mcr["/Pg"] = dst_page_obj
-        mcr["/MCID"] = pikepdf.Integer(mcid)
-        _append_kid(dst_elem, mcr)
+    for dst_annot, dst_elem in annot_entries:
+        key = int(dst_root.get("/ParentTreeNextKey", 0))
+        dst_annot["/StructParent"] = pikepdf.Integer(key)
+        _write_xobject_parent_table(dst_root, key, dst_elem)
 
     log.debug(
-        "_migrate_mcrs_for_page: slot=%d mcrs=%d src=%s",
-        dst_slot, len(mcid_to_dst_elem), src_path,
+        "_migrate_mcrs_for_page: slot=%d elems=%d mcrs=%d objrs=%d src=%s",
+        dst_slot, created, len(mcid_to_dst_elem), len(annot_entries), src_path,
     )
     return True
+
+
+def _elem_key(elem: pikepdf.Object):
+    og = getattr(elem, "objgen", (0, 0))
+    return og if og != (0, 0) else id(elem)
+
+
+def _as_kid_list(k) -> list:
+    if k is None:
+        return []
+    return list(k) if isinstance(k, pikepdf.Array) else [k]
+
+
+def _add_mcr(
+    dst: pikepdf.Pdf,
+    dst_elem: pikepdf.Object,
+    dst_page_obj: pikepdf.Object,
+    mcid: int,
+    mcid_to_dst_elem: "dict[int, pikepdf.Object]",
+) -> None:
+    # Indirect so pikepdf's walk_struct_tree can use a stable objgen for cycle detection.
+    mcr = dst.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name("/MCR"), Pg=dst_page_obj, MCID=pikepdf.Integer(mcid)))
+    _append_kid(dst_elem, mcr)
+    mcid_to_dst_elem[mcid] = dst_elem
+
+
+def _is_empty_table_part(elem: pikepdf.Object, cur_pg, page_og) -> bool:
+    """iText's retention rule for elements without content on the copied page.
+
+    Derived from iText 9.6 ``CopyPagesTo`` behaviour: an empty ``TD``/``TH`` whose
+    effective page is the copied page is kept; so is a ``TR``/``TBody``/... made
+    only of such cells.  Every other empty element (and a whole table without any
+    content) is dropped.
+    """
+    pg = elem.get("/Pg")
+    if pg is not None and hasattr(pg, "objgen"):
+        cur_pg = pg.objgen
+    elif cur_pg != page_og:
+        return False
+    role = str(elem.get("/S"))
+    kids = _as_kid_list(elem.get("/K"))
+    if role in _CELL_ROLES:
+        return not kids and cur_pg == page_og
+    if role in _ROW_ROLES:
+        return bool(kids) and all(
+            hasattr(k, "get") and k.get("/Type") not in (pikepdf.Name("/MCR"), pikepdf.Name("/OBJR"))
+            and _is_empty_table_part(k, cur_pg, page_og)
+            for k in kids
+        )
+    return False
+
+
+def _collect_page_annot_owners(
+    src_root: pikepdf.Object, src_page_obj: pikepdf.Object
+) -> "dict[int, pikepdf.Object]":
+    """Map annotation index -> owning struct element, via the annotations'
+    ``/StructParent`` entries in the source /ParentTree."""
+    out: dict[int, pikepdf.Object] = {}
+    annots = src_page_obj.get("/Annots")
+    pt = src_root.get("/ParentTree")
+    if annots is None or pt is None:
+        return out
+    wanted: dict[int, int] = {}                  # /StructParent key -> annotation index
+    for i, annot in enumerate(annots):
+        sp = annot.get("/StructParent") if hasattr(annot, "get") else None
+        if sp is not None:
+            wanted[int(sp)] = i
+    if not wanted:
+        return out
+    for key, val in _iter_parent_tree(pt):
+        i = wanted.get(key)
+        if i is not None and hasattr(val, "get") and val.get("/S") is not None:
+            out[i] = val
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -650,9 +795,14 @@ def migrate_tags_for_xobject(
     dst_page_obj: pikepdf.Object,
     *,
     src_path: "Path | str" = "",
+    explicit_attach: "pikepdf.Object | None" = None,
 ) -> bool:
     """Migrate the tag tree of a source page that has been embedded as a
     Form XObject into *dst*.
+
+    *explicit_attach* is the struct element the mirrored top-level elements are
+    attached to (C# ``explicitAttachPoint``; Mode B passes the ``<Document>``).
+    When ``None`` it is resolved from the page owner (:func:`_resolve_dest_attach`).
 
     Ports ``PdfMergeTagHelper.MigrateTagsForXObject`` (line 886).
 
@@ -725,7 +875,9 @@ def migrate_tags_for_xobject(
         del xobj_stream.stream_dict["/StructParents"]
 
     # Resolve destAttachPoint lazily
-    dest_attach = _resolve_dest_attach(dst_root, dst, dst_page_obj)
+    dest_attach = explicit_attach
+    if dest_attach is None:
+        dest_attach = _resolve_dest_attach(dst_root, dst, dst_page_obj)
 
     # Mirror ancestor chains for every real MCID; collect dest StructElem per mcid
     parent_map: dict[int, pikepdf.Object] = {}  # src_dict.objgen → dst StructElem
@@ -802,23 +954,50 @@ def _collect_page_mcrs(
         _walk_struct_for_page_mcrs(src_root, src_page_obj, out)
         return
 
-    slot = int(sp)
     pt = src_root.get("/ParentTree")
     if pt is None:
         return
-    nums = list(pt.get("/Nums", []))
-    for i in range(0, len(nums), 2):
-        try:
-            if int(nums[i]) != slot:
-                continue
-            val = nums[i + 1]
-            if isinstance(val, pikepdf.Array):
-                for mcid, elem in enumerate(val):
-                    if hasattr(elem, "get") and elem.get("/S") is not None:
-                        out[mcid] = elem
-            return
-        except Exception:
+    try:
+        val = _find_parent_tree_value(pt, int(sp))
+    except Exception:
+        return
+    if isinstance(val, pikepdf.Array):
+        for mcid, elem in enumerate(val):
+            if hasattr(elem, "get") and elem.get("/S") is not None:
+                out[mcid] = elem
+
+
+def _iter_parent_tree(node: pikepdf.Object):
+    """Yield (key, value) of a number tree (flat /Nums or nested /Kids)."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        nums = n.get("/Nums")
+        if nums is not None:
+            for i in range(0, len(nums) - 1, 2):
+                try:
+                    yield int(nums[i]), nums[i + 1]
+                except Exception:
+                    continue
+        stack.extend(reversed(list(n.get("/Kids", []) or [])))
+
+
+def _find_parent_tree_value(node: pikepdf.Object, key: int) -> "pikepdf.Object | None":
+    """Value stored under *key* in a number tree (flat /Nums or nested /Kids)."""
+    nums = node.get("/Nums")
+    if nums is not None:
+        for i in range(0, len(nums) - 1, 2):
+            if int(nums[i]) == key:
+                return nums[i + 1]
+        return None
+    for kid in node.get("/Kids", []) or []:
+        limits = kid.get("/Limits")
+        if limits is not None and not (int(limits[0]) <= key <= int(limits[1])):
             continue
+        found = _find_parent_tree_value(kid, key)
+        if found is not None:
+            return found
+    return None
 
 
 def _walk_struct_for_page_mcrs(
@@ -975,6 +1154,58 @@ def _find_page_owner(
     target_page: pikepdf.Object,
     _visited: "set | None" = None,
 ) -> "pikepdf.Object | None":
+    """Return the topmost StructElem (directly under ``<Document>`` / the root)
+    that owns marked content on *target_page*, or None.
+
+    Ports ``PdfMergeTagHelper.FindPageOwnerStructElem``: take the first MCR of
+    the page (the page's /ParentTree entry, in MCID order), then climb /P until
+    the parent is the ``<Document>`` or the StructTreeRoot.  When the page has
+    no /ParentTree entry yet, fall back to the first element whose /Pg is the
+    page.
+    """
+    owner = _page_owner_from_parent_tree(node, target_page)
+    if owner is not None:
+        return owner
+    return _find_page_owner_by_pg(node, target_page, _visited)
+
+
+def _page_owner_from_parent_tree(
+    root: pikepdf.Object, target_page: pikepdf.Object
+) -> "pikepdf.Object | None":
+    sp = target_page.get("/StructParents")
+    pt = root.get("/ParentTree")
+    if sp is None or pt is None:
+        return None
+    try:
+        arr = _find_parent_tree_array(pt, int(sp))
+    except Exception:
+        return None
+    if arr is None:
+        return None
+    for first in arr:
+        if not hasattr(first, "get") or first.get("/S") is None:
+            continue
+        cur = first
+        seen: set = set()
+        while True:
+            parent = cur.get("/P")
+            if parent is None or not hasattr(parent, "get"):
+                return cur
+            if parent.get("/S") == pikepdf.Name("/Document") or                     parent.get("/Type") == pikepdf.Name("/StructTreeRoot"):
+                return cur
+            key = getattr(parent, "objgen", None) or id(parent)
+            if key in seen:
+                return cur
+            seen.add(key)
+            cur = parent
+    return None
+
+
+def _find_page_owner_by_pg(
+    node: pikepdf.Object,
+    target_page: pikepdf.Object,
+    _visited: "set | None" = None,
+) -> "pikepdf.Object | None":
     """Return the StructElem whose /Pg == target_page, or None."""
     if _visited is None:
         _visited = set()
@@ -997,10 +1228,63 @@ def _find_page_owner(
     kids = list(k) if isinstance(k, pikepdf.Array) else ([k] if k is not None else [])
     for kid in kids:
         if hasattr(kid, "get"):
-            result = _find_page_owner(kid, target_page, _visited)
+            result = _find_page_owner_by_pg(kid, target_page, _visited)
             if result is not None:
                 return result
     return None
+
+
+def _new_dst_elem(
+    src_elem: pikepdf.Object,
+    dst: pikepdf.Pdf,
+    dst_page_obj: pikepdf.Object,
+    dst_parent: pikepdf.Object,
+) -> pikepdf.Object:
+    """Create a fresh dst StructElem mirroring *src_elem*'s role and attributes.
+
+    ``/K`` starts empty; ``/Pg`` is *dst_page_obj*.  Copies the non-structural
+    attributes (e.g. /Alt, /ActualText, /A, /Lang).
+    """
+    role = src_elem.get("/S")
+    new_elem = dst.make_indirect(pikepdf.Dictionary(
+        Type=pikepdf.Name("/StructElem"),
+        S=role,
+        Pg=dst_page_obj,
+        P=dst_parent,
+    ))
+    new_elem["/K"] = pikepdf.Array()
+
+    # Copy non-structural attributes (e.g. /Alt, /ActualText, /A, /Lang).
+    # All pikepdf Object values -- even direct (non-indirect) ones -- belong to
+    # their source Pdf and cannot be assigned directly into a different Pdf.
+    # Strategy:
+    #   1. copy_foreign() for indirect objects (works for dicts, arrays, streams).
+    #   2. For direct objects (og==(0,0)): use Object.parse on the unparse bytes,
+    #      which produces a fresh owner-independent value. Fall back to str()-based
+    #      reconstruction for strings, then to copy_foreign as last resort.
+    _SKIP_KEYS = {"/K", "/P", "/Pg", "/S", "/Type"}
+    for key in src_elem.keys():
+        if key in _SKIP_KEYS:
+            continue
+        try:
+            val = src_elem[key]
+            og = val.objgen
+            if og != (0, 0):
+                # Indirect object: copy_foreign deep-copies it into dst
+                new_elem[key] = dst.copy_foreign(val)
+            else:
+                # Direct object: re-parse from bytes (owner-neutral)
+                try:
+                    new_elem[key] = pikepdf.Object.parse(val.unparse())
+                except Exception:
+                    # Last-resort fallbacks for common types
+                    try:
+                        new_elem[key] = pikepdf.String(str(val))  # strings
+                    except Exception:
+                        pass
+        except Exception:
+            pass  # skip truly uncopyable entries
+    return new_elem
 
 
 def _ensure_ancestor_chain(
@@ -1054,45 +1338,7 @@ def _ensure_ancestor_chain(
     if role is None:
         return None
 
-    # Build a fresh dst StructElem, copying non-structural attributes
-    new_elem = dst.make_indirect(pikepdf.Dictionary(
-        Type=pikepdf.Name("/StructElem"),
-        S=role,
-        Pg=dst_page_obj,
-        P=dst_parent,
-    ))
-    new_elem["/K"] = pikepdf.Array()
-
-    # Copy non-structural attributes (e.g. /Alt, /ActualText, /A, /Lang).
-    # All pikepdf Object values -- even direct (non-indirect) ones -- belong to
-    # their source Pdf and cannot be assigned directly into a different Pdf.
-    # Strategy:
-    #   1. copy_foreign() for indirect objects (works for dicts, arrays, streams).
-    #   2. For direct objects (og==(0,0)): use Object.parse on the unparse bytes,
-    #      which produces a fresh owner-independent value. Fall back to str()-based
-    #      reconstruction for strings, then to copy_foreign as last resort.
-    _SKIP_KEYS = {"/K", "/P", "/Pg", "/S", "/Type"}
-    for key in src_elem.keys():
-        if key in _SKIP_KEYS:
-            continue
-        try:
-            val = src_elem[key]
-            og = val.objgen
-            if og != (0, 0):
-                # Indirect object: copy_foreign deep-copies it into dst
-                new_elem[key] = dst.copy_foreign(val)
-            else:
-                # Direct object: re-parse from bytes (owner-neutral)
-                try:
-                    new_elem[key] = pikepdf.Object.parse(val.unparse())
-                except Exception:
-                    # Last-resort fallbacks for common types
-                    try:
-                        new_elem[key] = pikepdf.String(str(val))  # strings
-                    except Exception:
-                        pass
-        except Exception:
-            pass  # skip truly uncopyable entries
+    new_elem = _new_dst_elem(src_elem, dst, dst_page_obj, dst_parent)
 
     # Attach under dst_parent
     _append_kid(dst_parent, new_elem)

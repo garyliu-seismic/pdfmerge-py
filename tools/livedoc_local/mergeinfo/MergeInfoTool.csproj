@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Office-free merge-info extractor (dev/QA tool, NOT production).
+    References the *released* CTS LiveDoc converter assemblies from a local checkout of
+    content-transformation-service-v2; nothing third-party is committed here.
+    Build with: python build.py (see build.py for the CTS assemblies path option)
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>MergeInfoTool</AssemblyName>
+    <CtsDir>$([MSBuild]::EnsureTrailingSlash('$(CtsAssemblies)'))</CtsDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Seismic.CTS.Implements.LiveDocs"><HintPath>$(CtsDir)Seismic.CTS.Implements.LiveDocs.dll</HintPath></Reference>
+    <Reference Include="DocumentFormat.OpenXml"><HintPath>$(CtsDir)DocumentFormat.OpenXml.dll</HintPath></Reference>
+    <Reference Include="DocumentFormat.OpenXml.Framework"><HintPath>$(CtsDir)DocumentFormat.OpenXml.Framework.dll</HintPath></Reference>
+  </ItemGroup>
+  <!-- Copy all runtime deps of the released converter into our output dir, and use its deps.json
+       as ours (needed so System.IO.Packaging 8.0.0.0 resolves). -->
+  <Target Name="CopyCtsRuntime" AfterTargets="Build">
+    <ItemGroup>
+      <CtsFiles Include="$(CtsDir)*.dll;$(CtsDir)*.json" Exclude="$(CtsDir)Seismic.CTS.Converter.LiveDoc.deps.json;$(CtsDir)Seismic.CTS.Converter.LiveDoc.runtimeconfig.json" />
+    </ItemGroup>
+    <Copy SourceFiles="@(CtsFiles)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(CtsDir)Seismic.CTS.Converter.LiveDoc.deps.json" DestinationFiles="$(OutDir)MergeInfoTool.deps.json" Condition="Exists('$(CtsDir)Seismic.CTS.Converter.LiveDoc.deps.json')" />
+  </Target>
+</Project>

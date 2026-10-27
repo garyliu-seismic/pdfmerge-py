@@ -1,0 +1,4 @@
+mergeinfo/bin/
+mergeinfo/obj/
+__pycache__/
+*.pyc

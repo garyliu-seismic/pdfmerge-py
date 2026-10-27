@@ -396,3 +396,45 @@ def test_hostile_struct_tree_cli(tmp_path: Path) -> None:
     from pdfmergepy.cli import main
     src = _cyclic_pdf(tmp_path / "s.pdf")
     assert main(["merge", str(src), "-o", str(tmp_path / "o.pdf")]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Untagged plain main pages must not keep a dangling /StructParents (caseB_mixed shape)
+# ---------------------------------------------------------------------------
+
+def _structparents_keys(pdf: pikepdf.Pdf) -> set[int]:
+    nums = pdf.Root.StructTreeRoot.ParentTree.Nums
+    return {int(nums[i]) for i in range(0, len(nums), 2)}
+
+
+def test_untagged_plain_main_pages_have_no_dangling_structparents(tmp_path: Path) -> None:
+    """Main pages 3 and 5 carry no marked content but a stale /StructParents (2, 4) whose
+    ParentTree key does not exist (keys 0, 1, 3 only), like the caseB_mixed main PDF.  They
+    are copied plain (only slide 2 is replaced): the merged pages must drop the dangling key
+    (as the C# merger leaves no /StructParents), and every kept key must resolve."""
+    build_pdf(tmp_path / "main.pdf", 5)
+    with pikepdf.open(tmp_path / "main.pdf", allow_overwriting_input=True) as m:
+        nums = m.Root.StructTreeRoot.ParentTree.Nums
+        keep = Array()
+        for i in range(0, len(nums), 2):
+            if int(nums[i]) in (0, 1, 3):
+                keep.append(nums[i]); keep.append(nums[i + 1])
+        m.Root.StructTreeRoot.ParentTree.Nums = keep
+        for i in (2, 4):
+            m.pages[i].obj.Contents = m.make_stream(b"BT /F1 12 Tf 10 150 Td (plain) Tj ET\n")
+            m.pages[i].obj.StructParents = i               # 2 and 4: not in the ParentTree
+        m.pages[1].obj.StructParents = 1
+        m.save(tmp_path / "main2.pdf")
+    (tmp_path / "main2.pdf").replace(tmp_path / "main.pdf")
+    build_pdf(tmp_path / "ext.pdf", 1, text_prefix="Ext")
+    _xml(tmp_path / "m.xml", {2: 1}, 5, fit="true")
+    out = tmp_path / "out.pdf"
+    merge_from_xml(parse_merge_info(tmp_path / "m.xml"), tmp_path / "main.pdf", tmp_path, out)
+    with pikepdf.open(out) as pdf:
+        assert _problems(pdf) == {}
+        keys = _structparents_keys(pdf)
+        for n in (3, 5):
+            assert "/StructParents" not in pdf.pages[n - 1].obj
+        for page in pdf.pages:
+            if "/StructParents" in page.obj:
+                assert int(page.obj.StructParents) in keys

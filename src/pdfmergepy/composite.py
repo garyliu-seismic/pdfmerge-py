@@ -716,11 +716,16 @@ def merge_from_xml(
                         dst, main_pdf, main_page_index, src_path=main_pdf_path
                     )
                     # Tag-tree merge: main_pdf still open → copy_foreign safe
-                    merge_page_tags(
-                        main_pdf, dst, dst.pages[-1].obj,
+                    plain_page = dst.pages[-1].obj
+                    migrated = merge_page_tags(
+                        main_pdf, dst, plain_page,
                         src_page_index=main_page_index,
                         src_path=main_pdf_path,
                     )
+                    # No ParentTree entry was written (untagged page / no marked
+                    # content): the /StructParents copied with the page would dangle.
+                    if not migrated and "/StructParents" in plain_page:
+                        del plain_page["/StructParents"]
                     outlines.copy_page(main_pdf, main_page_index, dst.pages[-1].obj)
 
             dst.docinfo["/Producer"] = "pdfmergepy (pikepdf/QPDF)"

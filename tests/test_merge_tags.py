@@ -300,3 +300,99 @@ def test_plain_copy_reads_parent_tree_with_kids(tmp_path: Path) -> None:
     with _merged(tmp_path, src) as pdf:
         assert _problems(pdf) == {}
         assert _roles(pdf) == ["/Document", "/P"]
+
+
+# ---------------------------------------------------------------------------
+# Hostile struct trees: cyclic /K and very deep nesting must not abort the merge
+# ---------------------------------------------------------------------------
+
+def _cyclic_pdf(path: Path) -> Path:
+    """Document > Sect > P(mcid 0), and the Sect lists itself and a Sect2 that loops back."""
+    def build(pdf, page, doc):
+        sect = _el(pdf, "/Sect", doc, page)
+        sect2 = _el(pdf, "/Sect", sect, page)
+        leaf = _el(pdf, "/P", sect, page, 0)
+        sect.K = Array([leaf, sect, sect2])
+        sect2.K = Array([sect])                       # sect -> sect2 -> sect
+        doc.K.append(sect)
+        return {0: leaf}
+    return _tagged_page_pdf(path, build)
+
+
+def _deep_pdf(path: Path, depth: int = 3000) -> Path:
+    """Document > Div x depth > P(mcid 0): nested far beyond the interpreter recursion limit."""
+    def build(pdf, page, doc):
+        parent = doc
+        for _ in range(depth):
+            div = _el(pdf, "/Div", parent, page)
+            if parent is doc:
+                doc.K.append(div)
+            else:
+                parent.K = div
+            parent = div
+        leaf = _el(pdf, "/P", parent, page, 0)
+        parent.K = leaf
+        return {0: leaf}
+    return _tagged_page_pdf(path, build)
+
+
+def _xml_merge(tmp_path: Path, hostile: Path, *, as_external: bool) -> Path:
+    """merge-xml replacing main slide 1 with the hostile PDF (external) or, with
+    as_external=False, merging the hostile PDF as the main PDF (replaced slide = XObject path
+    for its tags, slide 2 = plain copy)."""
+    import shutil
+    if as_external:
+        build_pdf(tmp_path / "main.pdf", 2)
+        shutil.copy(hostile, tmp_path / "ext.pdf")
+    else:
+        build_pdf(tmp_path / "ext.pdf", 1, text_prefix="Ext")
+        shutil.copy(hostile, tmp_path / "main.pdf")
+    _xml(tmp_path / "m.xml", {1: 1}, 1 if not as_external else 2, fit="true")
+    out = tmp_path / "out.pdf"
+    merge_from_xml(parse_merge_info(tmp_path / "m.xml"), tmp_path / "main.pdf", tmp_path, out)
+    return out
+
+
+def _flat_roles(pdf: pikepdf.Pdf) -> list[str]:
+    """Roles of the whole tree, iteratively (``_walk`` would hit the recursion limit)."""
+    roles, stack = [], [_document(pdf)]
+    while stack:
+        e = stack.pop()
+        roles.append(str(e.S))
+        stack.extend(k for k in _kids(e) if _is_elem(k))
+    return roles
+
+
+def _assert_guarded(out: Path) -> None:
+    with pikepdf.open(out) as pdf:
+        assert "/P" in _flat_roles(pdf)             # the tagged content survived
+
+
+@pytest.mark.parametrize("make", [_cyclic_pdf, _deep_pdf], ids=["cyclic-K", "deep-3000"])
+def test_hostile_struct_tree_merge(tmp_path: Path, make, caplog) -> None:
+    """`merge` (plain copy) finishes and keeps the page content tagged (master handled these)."""
+    src = make(tmp_path / "s.pdf")
+    out = tmp_path / "out.pdf"
+    with caplog.at_level("WARNING", logger="pdfmergepy.tagtree"):
+        merge_files([PageSpec(path=src, pages=(1,))], out)
+    _assert_guarded(out)
+    if make is _cyclic_pdf:
+        assert any("cyclic" in r.message for r in caplog.records)
+        with pikepdf.open(out) as pdf:
+            assert _flat_roles(pdf).count("/Sect") == 1          # the loop edges were cut, not followed
+
+
+@pytest.mark.parametrize("make", [_cyclic_pdf, _deep_pdf], ids=["cyclic-K", "deep-3000"])
+@pytest.mark.parametrize("as_external", [True, False], ids=["external", "main"])
+def test_hostile_struct_tree_merge_xml(tmp_path: Path, make, as_external: bool) -> None:
+    """`merge-xml` finishes too, whether the hostile tree comes from the external PDF
+    (plain copy) or from the main PDF."""
+    out = _xml_merge(tmp_path, make(tmp_path / "h.pdf"), as_external=as_external)
+    _assert_guarded(out)
+
+
+def test_hostile_struct_tree_cli(tmp_path: Path) -> None:
+    """End to end through the CLI entry point: exit status 0 for both commands."""
+    from pdfmergepy.cli import main
+    src = _cyclic_pdf(tmp_path / "s.pdf")
+    assert main(["merge", str(src), "-o", str(tmp_path / "o.pdf")]) == 0

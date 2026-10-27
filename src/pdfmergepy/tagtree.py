@@ -624,7 +624,8 @@ def _migrate_mcrs_for_page(
     annot_entries: list[tuple[pikepdf.Object, pikepdf.Object]] = []   # (dst_annot, dst_elem)
     created = 0
 
-    def mirror(src_elem, dst_parent, cur_pg, parent_ok: bool) -> None:
+    def enter(src_elem, dst_parent, cur_pg, parent_ok: bool, on_path: set):
+        """Mirror *src_elem* under *dst_parent*; returns the frame to descend into, or None."""
         nonlocal created
         own_pg = src_elem.get("/Pg")
         if own_pg is not None and hasattr(own_pg, "objgen"):
@@ -632,14 +633,34 @@ def _migrate_mcrs_for_page(
         in_marked = _elem_key(src_elem) in marked
         if not in_marked:
             if not (parent_ok and _is_empty_table_part(src_elem, cur_pg, page_og)):
-                return
+                return None
         if src_elem.get("/S") is None:
-            return
+            return None
+        key = _elem_key(src_elem)
+        if key in on_path:
+            # hostile input: /K loops back to an ancestor; cutting the edge keeps the tree finite
+            log.warning("tagtree: cyclic struct-tree /K at %s (src=%s); subtree skipped",
+                        key, src_path)
+            return None
         dst_elem = _new_dst_elem(src_elem, dst, dst_page_obj, dst_parent)
         _append_kid(dst_parent, dst_elem)
         created += 1
-        child_ok = in_marked or parent_ok
-        for kid in _as_kid_list(src_elem.get("/K")):
+        on_path.add(key)
+        return (key, dst_elem, iter(_as_kid_list(src_elem.get("/K"))), cur_pg, in_marked or parent_ok)
+
+    def mirror(src_top, dst_parent) -> None:
+        """Iterative top-down mirror (explicit stack): struct trees nested thousands of
+        levels deep must not hit the interpreter's recursion limit."""
+        on_path: set = set()
+        top = enter(src_top, dst_parent, None, False, on_path)
+        stack = [top] if top else []
+        while stack:
+            key, dst_elem, kids, cur_pg, child_ok = stack[-1]
+            kid = next(kids, None)
+            if kid is None:
+                on_path.discard(key)
+                stack.pop()
+                continue
             if isinstance(kid, int):
                 if cur_pg in (page_og, None):
                     _add_mcr(dst, dst_elem, dst_page_obj, int(kid), mcid_to_dst_elem)
@@ -657,14 +678,15 @@ def _migrate_mcrs_for_page(
                 kpg = kpg.objgen if kpg is not None and hasattr(kpg, "objgen") else cur_pg
                 obj = kid.get("/Obj")
                 i = annot_index.get(getattr(obj, "objgen", None))
-                if kpg in (page_og, None) and i is not None and i < len(dst_annots) \
-                        and dst_annots[i].get("/Subtype") == src_annots[i].get("/Subtype"):
+                if kpg in (page_og, None) and i is not None and i < len(dst_annots)                         and dst_annots[i].get("/Subtype") == src_annots[i].get("/Subtype"):
                     objr = dst.make_indirect(pikepdf.Dictionary(
                         Type=pikepdf.Name("/OBJR"), Pg=dst_page_obj, Obj=dst_annots[i]))
                     _append_kid(dst_elem, objr)
                     annot_entries.append((dst_annots[i], dst_elem))
             else:
-                mirror(kid, dst_elem, cur_pg, child_ok)
+                frame = enter(kid, dst_elem, cur_pg, child_ok, on_path)
+                if frame:
+                    stack.append(frame)
 
     # <Document> kids of the root are containers; their kids are the page-level elements
     tops: list = []
@@ -676,7 +698,7 @@ def _migrate_mcrs_for_page(
     for kid in tops:
         if hasattr(kid, "get") and kid.get("/Type") not in (
                 pikepdf.Name("/MCR"), pikepdf.Name("/OBJR")):
-            mirror(kid, dest_attach, None, False)
+            mirror(kid, dest_attach)
 
     if not created:
         return False
@@ -730,7 +752,7 @@ def _add_mcr(
     mcid_to_dst_elem[mcid] = dst_elem
 
 
-def _is_empty_table_part(elem: pikepdf.Object, cur_pg, page_og) -> bool:
+def _is_empty_table_part(elem: pikepdf.Object, cur_pg, page_og, _depth: int = 0) -> bool:
     """iText's retention rule for elements without content on the copied page.
 
     Derived from iText 9.6 ``CopyPagesTo`` behaviour: an empty ``TD``/``TH`` whose
@@ -738,6 +760,8 @@ def _is_empty_table_part(elem: pikepdf.Object, cur_pg, page_og) -> bool:
     only of such cells.  Every other empty element (and a whole table without any
     content) is dropped.
     """
+    if _depth > 32:          # real tables nest 3 levels; deeper is a cycle or hostile input
+        return False
     pg = elem.get("/Pg")
     if pg is not None and hasattr(pg, "objgen"):
         cur_pg = pg.objgen
@@ -750,7 +774,7 @@ def _is_empty_table_part(elem: pikepdf.Object, cur_pg, page_og) -> bool:
     if role in _ROW_ROLES:
         return bool(kids) and all(
             hasattr(k, "get") and k.get("/Type") not in (pikepdf.Name("/MCR"), pikepdf.Name("/OBJR"))
-            and _is_empty_table_part(k, cur_pg, page_og)
+            and _is_empty_table_part(k, cur_pg, page_og, _depth + 1)
             for k in kids
         )
     return False
@@ -1464,37 +1488,45 @@ def _collect_objr_refs(node: pikepdf.Object, out: set[int],
                        _parent_is_link: bool = False,
                        _visited: "set | None" = None) -> None:
     """Walk the struct tree and collect obj-numbers of annotations already
-    referenced via OBJR from a ``<Link>`` element."""
+    referenced via OBJR from a ``<Link>`` element.
+
+    Iterative (pre-order, source order): a struct tree may be nested thousands of
+    levels deep, beyond the interpreter's recursion limit."""
     if _visited is None:
         _visited = set()
-    if not isinstance(node, pikepdf.Dictionary):
-        return
-    key = getattr(node, "objgen", (0, 0))
-    key = key if key != (0, 0) else id(node)
-    if key in _visited:
-        return
-    _visited.add(key)
+    stack = [(node, _parent_is_link)]
+    while stack:
+        node, parent_is_link = stack.pop()
+        if not isinstance(node, pikepdf.Dictionary):
+            continue
+        key = getattr(node, "objgen", (0, 0))
+        key = key if key != (0, 0) else id(node)
+        if key in _visited:
+            continue
+        _visited.add(key)
 
-    is_link = (node.get("/S") == pikepdf.Name("/Link"))
+        is_link = (node.get("/S") == pikepdf.Name("/Link"))
 
-    k = node.get("/K")
-    kids: list = []
-    if k is None:
-        kids = []
-    elif isinstance(k, pikepdf.Array):
-        kids = list(k)
-    elif isinstance(k, pikepdf.Dictionary):
-        kids = [k]
+        k = node.get("/K")
+        kids: list = []
+        if k is None:
+            kids = []
+        elif isinstance(k, pikepdf.Array):
+            kids = list(k)
+        elif isinstance(k, pikepdf.Dictionary):
+            kids = [k]
 
-    for kid in kids:
-        if isinstance(kid, pikepdf.Dictionary):
-            if (is_link or _parent_is_link) and kid.get("/Type") == pikepdf.Name("/OBJR"):
-                annot_ref = kid.get("/Obj")
-                if annot_ref is not None:
-                    og = getattr(annot_ref, "objgen", (0, 0))
-                    if og != (0, 0):
-                        out.add(og[0])
-            _collect_objr_refs(kid, out, is_link, _visited)
+        todo = []
+        for kid in kids:
+            if isinstance(kid, pikepdf.Dictionary):
+                if (is_link or parent_is_link) and kid.get("/Type") == pikepdf.Name("/OBJR"):
+                    annot_ref = kid.get("/Obj")
+                    if annot_ref is not None:
+                        og = getattr(annot_ref, "objgen", (0, 0))
+                        if og != (0, 0):
+                            out.add(og[0])
+                todo.append((kid, is_link))
+        stack.extend(reversed(todo))
 
 
 def _next_parent_tree_key(nums: pikepdf.Array, dst_root: pikepdf.Object) -> int:
